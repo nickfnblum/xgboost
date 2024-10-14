@@ -177,7 +177,7 @@ double GroupRankingROC(Context const* ctx, common::Span<float const> predts,
   if (sum_w != 0) {
     auc /= sum_w;
   }
-  CHECK_LE(auc, 1.0f);
+  CHECK_LE(auc, 1.0 + kRtEps);
   return auc;
 }
 
@@ -264,9 +264,14 @@ class EvalAUC : public MetricNoCache {
       info.weights_.SetDevice(ctx_->Device());
     }
     //  We use the global size to handle empty dataset.
-    std::array<size_t, 2> meta{info.labels.Size(), preds.Size()};
+    std::array<bst_idx_t, 2> meta{info.labels.Size(), preds.Size()};
     if (!info.IsVerticalFederated()) {
-      collective::Allreduce<collective::Operation::kMax>(meta.data(), meta.size());
+      auto rc = collective::Allreduce(
+          ctx_,
+          linalg::MakeTensorView(DeviceOrd::CPU(), common::Span{meta.data(), meta.size()},
+                                 meta.size()),
+          collective::Op::kMax);
+      collective::SafeColl(rc);
     }
     if (meta[0] == 0) {
       // Empty across all workers, which is not supported.
@@ -290,8 +295,8 @@ class EvalAUC : public MetricNoCache {
 
       auc = collective::GlobalRatio(ctx_, info, auc, static_cast<double>(valid_groups));
       if (!std::isnan(auc)) {
-        CHECK_LE(auc, 1) << "Total AUC across groups: " << auc * valid_groups
-                         << ", valid groups: " << valid_groups;
+        CHECK_LE(auc, 1.0 + kRtEps) << "Total AUC across groups: " << auc * valid_groups
+                                    << ", valid groups: " << valid_groups;
       }
     } else if (meta[0] != meta[1] && meta[1] % meta[0] == 0) {
       /**
@@ -311,7 +316,8 @@ class EvalAUC : public MetricNoCache {
       }
       auc = collective::GlobalRatio(ctx_, info, auc, fp * tp);
       if (!std::isnan(auc)) {
-        CHECK_LE(auc, 1.0);
+        CHECK_LE(auc, 1.0 + kRtEps);
+        auc = std::min(auc, 1.0);
       }
     }
     if (std::isnan(auc)) {
@@ -330,12 +336,12 @@ class EvalROCAUC : public EvalAUC<EvalROCAUC> {
     double auc{0};
     uint32_t valid_groups = 0;
     auto n_threads = ctx_->Threads();
-    if (ctx_->IsCPU()) {
-      std::tie(auc, valid_groups) =
-          RankingAUC<true>(ctx_, predts.ConstHostVector(), info, n_threads);
-    } else {
+    if (ctx_->IsCUDA()) {
       std::tie(auc, valid_groups) =
           GPURankingAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_);
+    } else {
+      std::tie(auc, valid_groups) =
+          RankingAUC<true>(ctx_, predts.ConstHostVector(), info, n_threads);
     }
     return std::make_pair(auc, valid_groups);
   }
@@ -345,10 +351,10 @@ class EvalROCAUC : public EvalAUC<EvalROCAUC> {
     double auc{0};
     auto n_threads = ctx_->Threads();
     CHECK_NE(n_classes, 0);
-    if (ctx_->IsCPU()) {
-      auc = MultiClassOVR(ctx_, predts.ConstHostVector(), info, n_classes, n_threads, BinaryROCAUC);
-    } else {
+    if (ctx_->IsCUDA()) {
       auc = GPUMultiClassROCAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_, n_classes);
+    } else {
+      auc = MultiClassOVR(ctx_, predts.ConstHostVector(), info, n_classes, n_threads, BinaryROCAUC);
     }
     return auc;
   }
@@ -356,13 +362,13 @@ class EvalROCAUC : public EvalAUC<EvalROCAUC> {
   std::tuple<double, double, double>
   EvalBinary(HostDeviceVector<float> const &predts, MetaInfo const &info) {
     double fp, tp, auc;
-    if (ctx_->IsCPU()) {
+    if (ctx_->IsCUDA()) {
+      std::tie(fp, tp, auc) =
+          GPUBinaryROCAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_);
+    } else {
       std::tie(fp, tp, auc) = BinaryROCAUC(ctx_, predts.ConstHostVector(),
                                            info.labels.HostView().Slice(linalg::All(), 0),
                                            common::OptionalWeights{info.weights_.ConstHostSpan()});
-    } else {
-      std::tie(fp, tp, auc) =
-          GPUBinaryROCAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_);
     }
     return std::make_tuple(fp, tp, auc);
   }
@@ -407,23 +413,23 @@ class EvalPRAUC : public EvalAUC<EvalPRAUC> {
   std::tuple<double, double, double>
   EvalBinary(HostDeviceVector<float> const &predts, MetaInfo const &info) {
     double pr, re, auc;
-    if (ctx_->IsCPU()) {
+    if (ctx_->IsCUDA()) {
+      std::tie(pr, re, auc) = GPUBinaryPRAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_);
+    } else {
       std::tie(pr, re, auc) =
           BinaryPRAUC(ctx_, predts.ConstHostSpan(), info.labels.HostView().Slice(linalg::All(), 0),
                       common::OptionalWeights{info.weights_.ConstHostSpan()});
-    } else {
-      std::tie(pr, re, auc) = GPUBinaryPRAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_);
     }
     return std::make_tuple(pr, re, auc);
   }
 
   double EvalMultiClass(HostDeviceVector<float> const &predts, MetaInfo const &info,
                         size_t n_classes) {
-    if (ctx_->IsCPU()) {
+    if (ctx_->IsCUDA()) {
+      return GPUMultiClassPRAUC(ctx_, predts.ConstDeviceSpan(), info, &d_cache_, n_classes);
+    } else {
       auto n_threads = this->ctx_->Threads();
       return MultiClassOVR(ctx_, predts.ConstHostSpan(), info, n_classes, n_threads, BinaryPRAUC);
-    } else {
-      return GPUMultiClassPRAUC(ctx_, predts.ConstDeviceSpan(), info, &d_cache_, n_classes);
     }
   }
 
@@ -432,16 +438,16 @@ class EvalPRAUC : public EvalAUC<EvalPRAUC> {
     double auc{0};
     uint32_t valid_groups = 0;
     auto n_threads = ctx_->Threads();
-    if (ctx_->IsCPU()) {
+    if (ctx_->IsCUDA()) {
+      std::tie(auc, valid_groups) =
+          GPURankingPRAUC(ctx_, predts.ConstDeviceSpan(), info, &d_cache_);
+    } else {
       auto labels = info.labels.Data()->ConstHostSpan();
       if (std::any_of(labels.cbegin(), labels.cend(), PRAUCLabelInvalid{})) {
         InvalidLabels();
       }
       std::tie(auc, valid_groups) =
           RankingAUC<false>(ctx_, predts.ConstHostVector(), info, n_threads);
-    } else {
-      std::tie(auc, valid_groups) =
-          GPURankingPRAUC(ctx_, predts.ConstDeviceSpan(), info, &d_cache_);
     }
     return std::make_pair(auc, valid_groups);
   }

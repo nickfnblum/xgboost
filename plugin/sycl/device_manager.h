@@ -12,32 +12,31 @@
 
 #include <CL/sycl.hpp>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtautological-constant-compare"
+#pragma GCC diagnostic ignored "-W#pragma-messages"
 #include "xgboost/context.h"
+#pragma GCC diagnostic pop
 
 namespace xgboost {
 namespace sycl {
 
 class DeviceManager {
  public:
-  ::sycl::queue GetQueue(const DeviceOrd& device_spec) const;
-
-  ::sycl::device GetDevice(const DeviceOrd& device_spec) const;
+  ::sycl::queue* GetQueue(const DeviceOrd& device_spec) const;
 
  private:
-  using QueueRegister_t = std::unordered_map<std::string, ::sycl::queue>;
   constexpr static int kDefaultOrdinal = -1;
 
   struct DeviceRegister {
-    std::vector<::sycl::device> devices;
-    std::vector<::sycl::device> cpu_devices;
-    std::vector<::sycl::device> gpu_devices;
+    std::vector<::sycl::queue> queues;
+    std::unordered_map<::sycl::device, size_t> devices;
+    std::vector<size_t> cpu_devices_idxes;
+    std::vector<size_t> gpu_devices_idxes;
   };
-
-  QueueRegister_t& GetQueueRegister() const;
 
   DeviceRegister& GetDevicesRegister() const;
 
-  mutable std::mutex queue_registering_mutex;
   mutable std::mutex device_registering_mutex;
 };
 

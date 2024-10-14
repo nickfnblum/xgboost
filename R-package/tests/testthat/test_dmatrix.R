@@ -243,7 +243,7 @@ test_that("xgb.DMatrix: print", {
     txt <- capture.output({
         print(dtrain)
     })
-    expect_equal(txt, "xgb.DMatrix  dim: 6513 x 126  info: label weight base_margin  colnames: yes")
+    expect_equal(txt, "xgb.DMatrix  dim: 6513 x 126  info: base_margin, label, weight  colnames: yes")
 
     # DMatrix with just features
     dtrain <- xgb.DMatrix(
@@ -400,12 +400,10 @@ test_that("xgb.DMatrix: can take multi-dimensional 'base_margin'", {
     ),
     nround = 1
   )
-  pred_only_x <- predict(model, x, nthread = n_threads, reshape = TRUE)
+  pred_only_x <- predict(model, x)
   pred_w_base <- predict(
     model,
-    xgb.DMatrix(data = x, base_margin = b, nthread = n_threads),
-    nthread = n_threads,
-    reshape = TRUE
+    xgb.DMatrix(data = x, base_margin = b)
   )
   expect_equal(pred_only_x, pred_w_base - b, tolerance = 1e-5)
 })
@@ -480,7 +478,7 @@ test_that("xgb.DMatrix: QuantileDMatrix is not accepted by exact method", {
   })
 })
 
-test_that("xgb.DMatrix: ExternalDMatrix produces the same results as regular DMatrix", {
+test_that("xgb.DMatrix: ExtMemDMatrix produces the same results as regular DMatrix", {
   data(mtcars)
   y <- mtcars[, 1]
   x <- as.matrix(mtcars[, -1])
@@ -495,6 +493,7 @@ test_that("xgb.DMatrix: ExternalDMatrix produces the same results as regular DMa
     nrounds = 5
   )
   pred <- predict(model, x)
+  pred <- unname(pred)
 
   iterator_env <- as.environment(
     list(
@@ -529,8 +528,8 @@ test_that("xgb.DMatrix: ExternalDMatrix produces the same results as regular DMa
     f_reset = iterator_reset
   )
   cache_prefix <- tempdir()
-  edm <- xgb.ExternalDMatrix(data_iterator, cache_prefix, nthread = 1)
-  expect_true(inherits(edm, "xgb.ExternalDMatrix"))
+  edm <- xgb.ExtMemDMatrix(data_iterator, cache_prefix, nthread = 1)
+  expect_true(inherits(edm, "xgb.ExtMemDMatrix"))
   expect_true(inherits(edm, "xgb.DMatrix"))
   set.seed(123)
   model_ext <- xgb.train(
@@ -540,7 +539,7 @@ test_that("xgb.DMatrix: ExternalDMatrix produces the same results as regular DMa
   )
 
   pred_model1_edm <- predict(model, edm)
-  pred_model2_mat <- predict(model_ext, x)
+  pred_model2_mat <- predict(model_ext, x) |> unname()
   pred_model2_edm <- predict(model_ext, edm)
 
   expect_equal(pred_model1_edm, pred)
@@ -569,6 +568,7 @@ test_that("xgb.DMatrix: External QDM produces same results as regular QDM", {
     nrounds = 5
   )
   pred <- predict(model, x)
+  pred <- unname(pred)
 
   iterator_env <- as.environment(
     list(
@@ -618,7 +618,7 @@ test_that("xgb.DMatrix: External QDM produces same results as regular QDM", {
   )
 
   pred_model1_qdm <- predict(model, qdm)
-  pred_model2_mat <- predict(model_ext, x)
+  pred_model2_mat <- predict(model_ext, x) |> unname()
   pred_model2_qdm <- predict(model_ext, qdm)
 
   expect_equal(pred_model1_qdm, pred)
@@ -660,7 +660,7 @@ test_that("xgb.DMatrix: R errors thrown on DataIterator are thrown back to the u
     f_reset = iterator_reset
   )
   expect_error(
-    {xgb.ExternalDMatrix(data_iterator, nthread = 1)},
+    {xgb.ExtMemDMatrix(data_iterator, nthread = 1)},
     "custom error"
   )
 })
@@ -722,6 +722,44 @@ test_that("xgb.DMatrix: quantile cuts look correct", {
       expect_true(length(cuts) <= 9)
     }
   )
+})
+
+test_that("xgb.DMatrix: slicing keeps field indicators", {
+  data(mtcars)
+  x <- as.matrix(mtcars[, -1])
+  y <- mtcars[, 1]
+  dm <- xgb.DMatrix(
+    data = x,
+    label_lower_bound = -y,
+    label_upper_bound = y,
+    nthread = 1
+  )
+  idx_take <- seq(1, 5)
+  dm_slice <- xgb.slice.DMatrix(dm, idx_take)
+
+  expect_true(xgb.DMatrix.hasinfo(dm_slice, "label_lower_bound"))
+  expect_true(xgb.DMatrix.hasinfo(dm_slice, "label_upper_bound"))
+  expect_false(xgb.DMatrix.hasinfo(dm_slice, "label"))
+
+  expect_equal(getinfo(dm_slice, "label_lower_bound"), -y[idx_take], tolerance = 1e-6)
+  expect_equal(getinfo(dm_slice, "label_upper_bound"), y[idx_take], tolerance = 1e-6)
+})
+
+test_that("xgb.DMatrix: can slice with groups", {
+  data(iris)
+  x <- as.matrix(iris[, -5])
+  set.seed(123)
+  y <- sample(3, size = nrow(x), replace = TRUE)
+  group <- c(50, 50, 50)
+  dm <- xgb.DMatrix(x, label = y, group = group, nthread = 1)
+  idx_take <- seq(1, 50)
+  dm_slice <- xgb.slice.DMatrix(dm, idx_take, allow_groups = TRUE)
+
+  expect_true(xgb.DMatrix.hasinfo(dm_slice, "label"))
+  expect_false(xgb.DMatrix.hasinfo(dm_slice, "group"))
+  expect_false(xgb.DMatrix.hasinfo(dm_slice, "qid"))
+  expect_null(getinfo(dm_slice, "group"))
+  expect_equal(getinfo(dm_slice, "label"), y[idx_take], tolerance = 1e-6)
 })
 
 test_that("xgb.DMatrix: can read CSV", {

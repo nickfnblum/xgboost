@@ -15,17 +15,15 @@
 
 #include <cstdint>  // std::int32_t
 #include <cstdio>
-#include <fstream>
-#include <iostream>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
-#include "../../src/collective/communicator-inl.h"
-#include "../../src/common/common.h"
-#include "../../src/common/threading_utils.h"
-#include "../../src/data/array_interface.h"
+#if defined(__CUDACC__)
+#include "../../src/collective/communicator-inl.h"  // for GetRank
+#include "../../src/common/cuda_rt_utils.h"         // for AllVisibleGPUs
+#endif  // defined(__CUDACC__)
+
 #include "filesystem.h"  // dmlc::TemporaryDirectory
 #include "xgboost/linalg.h"
 
@@ -36,7 +34,7 @@
 #endif
 
 #if defined(__CUDACC__)
-#define GPUIDX (common::AllVisibleGPUs() == 1 ? 0 : collective::GetRank())
+#define GPUIDX (curt::AllVisibleGPUs() == 1 ? 0 : collective::GetRank())
 #else
 #define GPUIDX (-1)
 #endif
@@ -56,7 +54,7 @@ class GradientBooster;
 
 template <typename Float>
 Float RelError(Float l, Float r) {
-  static_assert(std::is_floating_point<Float>::value);
+  static_assert(std::is_floating_point_v<Float>);
   return std::abs(1.0f - l / r);
 }
 
@@ -168,8 +166,7 @@ class SimpleRealUniformDistribution {
   /*! \brief Over-simplified version of std::generate_canonical. */
   template <size_t Bits, typename GeneratorT>
   ResultT GenerateCanonical(GeneratorT* rng) const {
-    static_assert(std::is_floating_point<ResultT>::value,
-                  "Result type must be floating point.");
+    static_assert(std::is_floating_point_v<ResultT>, "Result type must be floating point.");
     long double const r = (static_cast<long double>(rng->Max())
                            - static_cast<long double>(rng->Min())) + 1.0L;
     auto const log2r = static_cast<size_t>(std::log(r) / std::log(2.0L));
@@ -223,7 +220,7 @@ Json GetArrayInterface(HostDeviceVector<T> const* storage, size_t rows, size_t c
 
 // Generate in-memory random data without using DMatrix.
 class RandomDataGenerator {
-  bst_row_t rows_;
+  bst_idx_t rows_;
   size_t cols_;
   float sparsity_;
 
@@ -231,6 +228,7 @@ class RandomDataGenerator {
   float upper_{1.0f};
 
   bst_target_t n_targets_{1};
+  bst_target_t n_classes_{0};
 
   DeviceOrd device_{DeviceOrd::CPU()};
   std::size_t n_batches_{0};
@@ -240,13 +238,15 @@ class RandomDataGenerator {
   bst_bin_t bins_{0};
   std::vector<FeatureType> ft_;
   bst_cat_t max_cat_{32};
+  bool on_host_{false};
+  std::int64_t min_cache_page_bytes_{0};
 
   Json ArrayInterfaceImpl(HostDeviceVector<float>* storage, size_t rows, size_t cols) const;
 
   void GenerateLabels(std::shared_ptr<DMatrix> p_fmat) const;
 
  public:
-  RandomDataGenerator(bst_row_t rows, size_t cols, float sparsity)
+  RandomDataGenerator(bst_idx_t rows, size_t cols, float sparsity)
       : rows_{rows}, cols_{cols}, sparsity_{sparsity}, lcg_{seed_} {}
 
   RandomDataGenerator& Lower(float v) {
@@ -263,6 +263,14 @@ class RandomDataGenerator {
   }
   RandomDataGenerator& Batches(std::size_t n_batches) {
     n_batches_ = n_batches;
+    return *this;
+  }
+  RandomDataGenerator& OnHost(bool on_host) {
+    on_host_ = on_host;
+    return *this;
+  }
+  RandomDataGenerator& MinPageCacheBytes(std::int64_t min_cache_page_bytes) {
+    this->min_cache_page_bytes_ = min_cache_page_bytes;
     return *this;
   }
   RandomDataGenerator& Seed(uint64_t s) {
@@ -288,6 +296,10 @@ class RandomDataGenerator {
     n_targets_ = n_targets;
     return *this;
   }
+  RandomDataGenerator& Classes(bst_target_t n_classes) {
+    n_classes_ = n_classes;
+    return *this;
+  }
 
   void GenerateDense(HostDeviceVector<float>* out) const;
 
@@ -308,19 +320,18 @@ class RandomDataGenerator {
 
   std::string GenerateColumnarArrayInterface(std::vector<HostDeviceVector<float>>* data) const;
 
-  void GenerateCSR(HostDeviceVector<float>* value, HostDeviceVector<bst_row_t>* row_ptr,
+  void GenerateCSR(HostDeviceVector<float>* value, HostDeviceVector<std::size_t>* row_ptr,
                    HostDeviceVector<bst_feature_t>* columns) const;
 
   [[nodiscard]] std::shared_ptr<DMatrix> GenerateDMatrix(
-      bool with_label = false, bool float_label = true, size_t classes = 1,
-      DataSplitMode data_split_mode = DataSplitMode::kRow) const;
+      bool with_label = false, DataSplitMode data_split_mode = DataSplitMode::kRow) const;
 
   [[nodiscard]] std::shared_ptr<DMatrix> GenerateSparsePageDMatrix(std::string prefix,
                                                                    bool with_label) const;
 
-#if defined(XGBOOST_USE_CUDA)
-  std::shared_ptr<DMatrix> GenerateDeviceDMatrix(bool with_label);
-#endif
+  [[nodiscard]] std::shared_ptr<DMatrix> GenerateExtMemQuantileDMatrix(std::string prefix,
+                                                                       bool with_label) const;
+
   std::shared_ptr<DMatrix> GenerateQuantileDMatrix(bool with_label);
 };
 
@@ -333,7 +344,7 @@ inline std::vector<float> GenerateRandomCategoricalSingleColumn(int n, size_t nu
   std::vector<float> x(n);
   std::mt19937 rng(0);
   std::uniform_int_distribution<size_t> dist(0, num_categories - 1);
-  std::generate(x.begin(), x.end(), [&]() { return dist(rng); });
+  std::generate(x.begin(), x.end(), [&]() { return static_cast<float>(dist(rng)); });
   // Make sure each category is present
   for (size_t i = 0; i < num_categories; i++) {
     x[i] = static_cast<decltype(x)::value_type>(i);
@@ -343,45 +354,6 @@ inline std::vector<float> GenerateRandomCategoricalSingleColumn(int n, size_t nu
 
 std::shared_ptr<DMatrix> GetDMatrixFromData(const std::vector<float>& x, std::size_t num_rows,
                                             bst_feature_t num_columns);
-
-/**
- * \brief Create Sparse Page using data iterator.
- *
- * \param n_samples  Total number of rows for all batches combined.
- * \param n_features Number of features
- * \param n_batches  Number of batches
- * \param prefix     Cache prefix, can be used for specifying file path.
- *
- * \return A Sparse DMatrix with n_batches.
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(bst_row_t n_samples, bst_feature_t n_features,
-                                                 size_t n_batches, std::string prefix = "cache");
-
-/**
- * Deprecated, stop using it
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(size_t n_entries, std::string prefix = "cache");
-
-/**
- * Deprecated, stop using it
- *
- * \brief Creates dmatrix with some records, each record containing random number of
- *        features in [1, n_cols]
- *
- * \param n_rows      Number of records to create.
- * \param n_cols      Max number of features within that record.
- * \param page_size   Sparse page size for the pages within the dmatrix. If page size is 0
- *                    then the entire dmatrix is resident in memory; else, multiple sparse pages
- *                    of page size are created and backed to disk, which would have to be
- *                    streamed in at point of use.
- * \param deterministic The content inside the dmatrix is constant for this configuration, if true;
- *                      else, the content changes every time this method is invoked
- *
- * \return The new dmatrix.
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrixWithRC(
-    size_t n_rows, size_t n_cols, size_t page_size, bool deterministic,
-    const dmlc::TemporaryDirectory& tempdir = dmlc::TemporaryDirectory());
 
 std::unique_ptr<GradientBooster> CreateTrainedGBM(std::string name, Args kwargs, size_t kRows,
                                                   size_t kCols,
@@ -413,12 +385,12 @@ inline HostDeviceVector<GradientPair> GenerateRandomGradients(const size_t n_row
   return gpair;
 }
 
-inline linalg::Matrix<GradientPair> GenerateRandomGradients(Context const* ctx, bst_row_t n_rows,
+inline linalg::Matrix<GradientPair> GenerateRandomGradients(Context const* ctx, bst_idx_t n_rows,
                                                             bst_target_t n_targets,
                                                             float lower = 0.0f,
                                                             float upper = 1.0f) {
   auto g = GenerateRandomGradients(n_rows * n_targets, lower, upper);
-  linalg::Matrix<GradientPair> gpair({n_rows, static_cast<bst_row_t>(n_targets)}, ctx->Device());
+  linalg::Matrix<GradientPair> gpair({n_rows, static_cast<bst_idx_t>(n_targets)}, ctx->Device());
   gpair.Data()->Copy(g);
   return gpair;
 }
@@ -434,12 +406,12 @@ class ArrayIterForTest {
 
   std::vector<std::string> batches_;
   std::string interface_;
-  size_t rows_;
+  bst_idx_t rows_;
   size_t cols_;
   size_t n_batches_;
 
  public:
-  size_t static constexpr Rows() { return 1024; }
+  bst_idx_t static constexpr Rows() { return 1024; }
   size_t static constexpr Batches() { return 100; }
   size_t static constexpr Cols() { return 13; }
 
@@ -451,7 +423,7 @@ class ArrayIterForTest {
   [[nodiscard]] std::size_t Iter() const { return iter_; }
   auto Proxy() -> decltype(proxy_) { return proxy_; }
 
-  explicit ArrayIterForTest(float sparsity, size_t rows, size_t cols, size_t batches);
+  explicit ArrayIterForTest(float sparsity, bst_idx_t rows, size_t cols, size_t batches);
   /**
    * \brief Create iterator with user provided data.
    */
@@ -470,7 +442,7 @@ class CudaArrayIterForTest : public ArrayIterForTest {
 
 class NumpyArrayIterForTest : public ArrayIterForTest {
  public:
-  explicit NumpyArrayIterForTest(float sparsity, size_t rows = Rows(), size_t cols = Cols(),
+  explicit NumpyArrayIterForTest(float sparsity, bst_idx_t rows = Rows(), size_t cols = Cols(),
                                  size_t batches = Batches());
   explicit NumpyArrayIterForTest(Context const* ctx, HostDeviceVector<float> const& data,
                                  std::size_t n_samples, bst_feature_t n_features,
@@ -494,6 +466,16 @@ inline int Next(DataIterHandle self) {
   return static_cast<ArrayIterForTest*>(self)->Next();
 }
 
+/**
+ * @brief Create an array interface for host vector.
+ */
+template <typename T>
+char const* Make1dInterfaceTest(T const* vec, std::size_t len) {
+  static thread_local std::string str;
+  str = linalg::Make1dInterface(vec, len);
+  return str.c_str();
+}
+
 class RMMAllocator;
 using RMMAllocatorPtr = std::unique_ptr<RMMAllocator, void(*)(RMMAllocator*)>;
 RMMAllocatorPtr SetUpRMMResourceForCppTests(int argc, char** argv);
@@ -511,68 +493,10 @@ inline LearnerModelParam MakeMP(bst_feature_t n_features, float base_score, uint
 
 inline std::int32_t AllThreadsForTest() { return Context{}.Threads(); }
 
-template <bool use_nccl = false, typename Function, typename... Args>
-void RunWithInMemoryCommunicator(int32_t world_size, Function&& function, Args&&... args) {
-  auto run = [&](auto rank) {
-    Json config{JsonObject()};
-    if constexpr (use_nccl) {
-      config["xgboost_communicator"] = String("in-memory-nccl");
-    } else {
-      config["xgboost_communicator"] = String("in-memory");
-    }
-    config["in_memory_world_size"] = world_size;
-    config["in_memory_rank"] = rank;
-    xgboost::collective::Init(config);
-
-    std::forward<Function>(function)(std::forward<Args>(args)...);
-
-    xgboost::collective::Finalize();
-  };
-#if defined(_OPENMP)
-  common::ParallelFor(world_size, world_size, run);
-#else
-  std::vector<std::thread> threads;
-  for (auto rank = 0; rank < world_size; rank++) {
-    threads.emplace_back(run, rank);
-  }
-  for (auto& thread : threads) {
-    thread.join();
-  }
-#endif
-}
-
-class BaseMGPUTest : public ::testing::Test {
- protected:
-  int world_size_;
-  bool use_nccl_{false};
-
-  void SetUp() override {
-    auto const n_gpus = common::AllVisibleGPUs();
-    if (n_gpus <= 1) {
-      // Use a single GPU to simulate distributed environment.
-      world_size_ = 3;
-      // NCCL doesn't like sharing a single GPU, so we use the adapter instead.
-      use_nccl_ = false;
-    } else {
-      // Use multiple GPUs for real.
-      world_size_ = n_gpus;
-      use_nccl_ = true;
-    }
-  }
-
-  template <typename Function, typename... Args>
-  void DoTest(Function&& function, Args&&... args) {
-    if (use_nccl_) {
-      RunWithInMemoryCommunicator<true>(world_size_, function, args...);
-    } else {
-      RunWithInMemoryCommunicator<false>(world_size_, function, args...);
-    }
-  }
-};
-
-class DeclareUnifiedDistributedTest(MetricTest) : public BaseMGPUTest{};
-
 inline DeviceOrd FstCU() { return DeviceOrd::CUDA(0); }
+
+// GPU device ordinal for distributed tests
+std::int32_t DistGpuIdx();
 
 inline auto GMockThrow(StringView msg) {
   return ::testing::ThrowsMessage<dmlc::Error>(::testing::HasSubstr(msg));

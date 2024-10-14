@@ -23,6 +23,7 @@ CONFIG = {
     "USE_NCCL": "OFF",
     "JVM_BINDINGS": "ON",
     "LOG_CAPI_INVOCATION": "OFF",
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
 }
 
 
@@ -50,7 +51,7 @@ def maybe_makedirs(path):
 
 def run(command, **kwargs):
     print(command)
-    subprocess.check_call(command, shell=True, **kwargs)
+    subprocess.run(command, shell=True, check=True, env=os.environ, **kwargs)
 
 
 def cp(source, target):
@@ -84,6 +85,8 @@ def native_build(args):
 
         if sys.platform == "linux":
             maybe_parallel_build = " -- -j $(nproc)"
+        elif sys.platform == "win32":
+            maybe_parallel_build = ' -- /m /nodeReuse:false "/consoleloggerparameters:ShowCommandLine;Verbosity=minimal"'
         else:
             maybe_parallel_build = ""
 
@@ -96,10 +99,6 @@ def native_build(args):
             CONFIG["USE_DLOPEN_NCCL"] = "OFF"
 
         args = ["-D{0}:BOOL={1}".format(k, v) for k, v in CONFIG.items()]
-
-        # if enviorment set rabit_mock
-        if os.getenv("RABIT_MOCK", None) is not None:
-            args.append("-DRABIT_MOCK:BOOL=ON")
 
         # if enviorment set GPU_ARCH_FLAG
         gpu_arch_flag = os.getenv("GPU_ARCH_FLAG", None)
@@ -132,14 +131,6 @@ def native_build(args):
                 run("cmake .. " + " ".join(args))
             run("cmake --build . --config Release" + maybe_parallel_build)
 
-        with cd("demo/CLI/regression"):
-            run(f'"{sys.executable}" mapfeat.py')
-            run(f'"{sys.executable}" mknfold.py machine.txt 1')
-
-    xgboost4j = "xgboost4j-gpu" if cli_args.use_cuda == "ON" else "xgboost4j"
-    xgboost4j_spark = (
-        "xgboost4j-spark-gpu" if cli_args.use_cuda == "ON" else "xgboost4j-spark"
-    )
 
     print("copying native library")
     library_name, os_folder = {
@@ -156,44 +147,42 @@ def native_build(args):
         "arm64": "aarch64",  # on macOS & Windows ARM 64-bit
         "aarch64": "aarch64",
     }[platform.machine().lower()]
-    output_folder = "{}/src/main/resources/lib/{}/{}".format(
-        xgboost4j, os_folder, arch_folder
+    output_folder = "xgboost4j/src/main/resources/lib/{}/{}".format(
+        os_folder, arch_folder
     )
     maybe_makedirs(output_folder)
     cp("../lib/" + library_name, output_folder)
 
-    print("copying pure-Python tracker")
-    cp(
-        "../python-package/xgboost/tracker.py",
-        "{}/src/main/resources".format(xgboost4j),
-    )
-
     print("copying train/test files")
-    maybe_makedirs("{}/src/test/resources".format(xgboost4j_spark))
+
+    # for xgboost4j
+    maybe_makedirs("xgboost4j/src/test/resources")
+    for file in glob.glob("../demo/data/agaricus.*"):
+        cp(file, "xgboost4j/src/test/resources")
+
+    # for xgboost4j-spark
+    maybe_makedirs("xgboost4j-spark/src/test/resources")
     with cd("../demo/CLI/regression"):
         run(f'"{sys.executable}" mapfeat.py')
         run(f'"{sys.executable}" mknfold.py machine.txt 1')
-
     for file in glob.glob("../demo/CLI/regression/machine.txt.t*"):
-        cp(file, "{}/src/test/resources".format(xgboost4j_spark))
+        cp(file, "xgboost4j-spark/src/test/resources")
     for file in glob.glob("../demo/data/agaricus.*"):
-        cp(file, "{}/src/test/resources".format(xgboost4j_spark))
+        cp(file, "xgboost4j-spark/src/test/resources")
 
-    maybe_makedirs("{}/src/test/resources".format(xgboost4j))
-    for file in glob.glob("../demo/data/agaricus.*"):
-        cp(file, "{}/src/test/resources".format(xgboost4j))
+    # for xgboost4j-spark-gpu
+    if cli_args.use_cuda == "ON":
+        maybe_makedirs("xgboost4j-spark-gpu/src/test/resources")
+        for file in glob.glob("../demo/data/veterans_lung_cancer.csv"):
+            cp(file, "xgboost4j-spark-gpu/src/test/resources")
+        cp("xgboost4j-spark/src/test/resources/rank.train.csv", "xgboost4j-spark-gpu/src/test/resources")
 
 
 if __name__ == "__main__":
-    if "MAVEN_SKIP_NATIVE_BUILD" in os.environ:
-        print("MAVEN_SKIP_NATIVE_BUILD is set. Skipping native build...")
-    else:
-        parser = argparse.ArgumentParser()
-        parser.add_argument(
-            "--log-capi-invocation", type=str, choices=["ON", "OFF"], default="OFF"
-        )
-        parser.add_argument(
-            "--use-cuda", type=str, choices=["ON", "OFF"], default="OFF"
-        )
-        cli_args = parser.parse_args()
-        native_build(cli_args)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--log-capi-invocation", type=str, choices=["ON", "OFF"], default="OFF"
+    )
+    parser.add_argument("--use-cuda", type=str, choices=["ON", "OFF"], default="OFF")
+    cli_args = parser.parse_args()
+    native_build(cli_args)

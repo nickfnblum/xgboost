@@ -21,7 +21,6 @@ $(foreach v, $(XGB_RFLAGS), $(warning $(v)))
 PKG_CPPFLAGS = \
     -I$(PKGROOT)/include \
     -I$(PKGROOT)/dmlc-core/include \
-    -I$(PKGROOT)/rabit/include \
     -I$(PKGROOT) \
     $(XGB_RFLAGS)
 
@@ -73,6 +72,10 @@ OBJECTS= \
     $(PKGROOT)/src/data/gradient_index_page_source.o \
     $(PKGROOT)/src/data/gradient_index_format.o \
     $(PKGROOT)/src/data/sparse_page_dmatrix.o \
+    $(PKGROOT)/src/data/sparse_page_source.o \
+    $(PKGROOT)/src/data/extmem_quantile_dmatrix.o \
+    $(PKGROOT)/src/data/quantile_dmatrix.o \
+    $(PKGROOT)/src/data/batch_utils.o \
     $(PKGROOT)/src/data/proxy_dmatrix.o \
     $(PKGROOT)/src/data/iterative_dmatrix.o \
     $(PKGROOT)/src/predictor/predictor.o \
@@ -99,21 +102,21 @@ OBJECTS= \
     $(PKGROOT)/src/context.o \
     $(PKGROOT)/src/logging.o \
     $(PKGROOT)/src/global_config.o \
+    $(PKGROOT)/src/collective/result.o \
     $(PKGROOT)/src/collective/allgather.o \
     $(PKGROOT)/src/collective/allreduce.o \
     $(PKGROOT)/src/collective/broadcast.o \
     $(PKGROOT)/src/collective/comm.o \
+    $(PKGROOT)/src/collective/comm_group.o \
     $(PKGROOT)/src/collective/coll.o \
-    $(PKGROOT)/src/collective/communicator-inl.o \
     $(PKGROOT)/src/collective/tracker.o \
-    $(PKGROOT)/src/collective/communicator.o \
-    $(PKGROOT)/src/collective/in_memory_communicator.o \
     $(PKGROOT)/src/collective/in_memory_handler.o \
     $(PKGROOT)/src/collective/loop.o \
     $(PKGROOT)/src/collective/socket.o \
     $(PKGROOT)/src/common/charconv.o \
     $(PKGROOT)/src/common/column_matrix.o \
     $(PKGROOT)/src/common/common.o \
+    $(PKGROOT)/src/common/cuda_rt_utils.o \
     $(PKGROOT)/src/common/error_msg.o \
     $(PKGROOT)/src/common/hist_util.o \
     $(PKGROOT)/src/common/host_device_vector.o \
@@ -132,7 +135,4 @@ OBJECTS= \
     $(PKGROOT)/src/common/version.o \
     $(PKGROOT)/src/c_api/c_api.o \
     $(PKGROOT)/src/c_api/c_api_error.o \
-    $(PKGROOT)/amalgamation/dmlc-minimum0.o \
-    $(PKGROOT)/rabit/src/engine.o \
-    $(PKGROOT)/rabit/src/rabit_c_api.o \
-    $(PKGROOT)/rabit/src/allreduce_base.o
+    $(PKGROOT)/amalgamation/dmlc-minimum0.o

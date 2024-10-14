@@ -18,7 +18,7 @@ def test_array_interface() -> None:
     np.testing.assert_equal(cp.asnumpy(arr), cp.asnumpy(ret))
 
 
-def dmatrix_from_cupy(input_type, DMatrixT, missing=np.NAN):
+def dmatrix_from_cupy(input_type, DMatrixT, missing=np.nan):
     """Test constructing DMatrix from cupy"""
     kRows = 80
     kCols = 3
@@ -46,9 +46,9 @@ def dmatrix_from_cupy(input_type, DMatrixT, missing=np.NAN):
 
 def _test_from_cupy(DMatrixT):
     """Test constructing DMatrix from cupy"""
-    dmatrix_from_cupy(np.float16, DMatrixT, np.NAN)
-    dmatrix_from_cupy(np.float32, DMatrixT, np.NAN)
-    dmatrix_from_cupy(np.float64, DMatrixT, np.NAN)
+    dmatrix_from_cupy(np.float16, DMatrixT, np.nan)
+    dmatrix_from_cupy(np.float32, DMatrixT, np.nan)
+    dmatrix_from_cupy(np.float64, DMatrixT, np.nan)
 
     dmatrix_from_cupy(np.uint8, DMatrixT, 2)
     dmatrix_from_cupy(np.uint32, DMatrixT, 3)
@@ -66,7 +66,7 @@ def _test_from_cupy(DMatrixT):
 
 def _test_cupy_training(DMatrixT):
     np.random.seed(1)
-    cp.random.seed(1)
+    cp.random.seed(np.uint64(1))
     X = cp.random.randn(50, 10, dtype="float32")
     y = cp.random.randn(50, dtype="float32")
     weights = np.random.random(50) + 1
@@ -131,7 +131,7 @@ def _test_cupy_metainfo(DMatrixT):
 @pytest.mark.skipif(**tm.no_sklearn())
 def test_cupy_training_with_sklearn():
     np.random.seed(1)
-    cp.random.seed(1)
+    cp.random.seed(np.uint64(1))
     X = cp.random.randn(50, 10, dtype="float32")
     y = (cp.random.randn(50, dtype="float32") > 0).astype("int8")
     weights = np.random.random(50) + 1
@@ -210,7 +210,7 @@ class TestFromCupy:
 
     @pytest.mark.skipif(**tm.no_cupy())
     def test_qid(self):
-        rng = cp.random.RandomState(1994)
+        rng = cp.random.RandomState(np.uint64(1994))
         rows = 100
         cols = 10
         X, y = rng.randn(rows, cols), rng.randn(rows)

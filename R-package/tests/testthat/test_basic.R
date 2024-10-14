@@ -162,20 +162,20 @@ test_that("train and predict softprob", {
   pred <- predict(bst, as.matrix(iris[, -5]))
   expect_length(pred, nrow(iris) * 3)
   # row sums add up to total probability of 1:
-  expect_equal(rowSums(matrix(pred, ncol = 3, byrow = TRUE)), rep(1, nrow(iris)), tolerance = 1e-7)
+  expect_equal(rowSums(pred), rep(1, nrow(iris)), tolerance = 1e-7)
   # manually calculate error at the last iteration:
-  mpred <- predict(bst, as.matrix(iris[, -5]), reshape = TRUE)
-  expect_equal(as.numeric(t(mpred)), pred)
+  mpred <- predict(bst, as.matrix(iris[, -5]))
+  expect_equal(mpred, pred)
   pred_labels <- max.col(mpred) - 1
   err <- sum(pred_labels != lb) / length(lb)
   expect_equal(attributes(bst)$evaluation_log[5, train_merror], err, tolerance = 5e-6)
   # manually calculate error at the 1st iteration:
-  mpred <- predict(bst, as.matrix(iris[, -5]), reshape = TRUE, iterationrange = c(1, 1))
+  mpred <- predict(bst, as.matrix(iris[, -5]), iterationrange = c(1, 1))
   pred_labels <- max.col(mpred) - 1
   err <- sum(pred_labels != lb) / length(lb)
   expect_equal(attributes(bst)$evaluation_log[1, train_merror], err, tolerance = 5e-6)
 
-  mpred1 <- predict(bst, as.matrix(iris[, -5]), reshape = TRUE, iterationrange = c(1, 1))
+  mpred1 <- predict(bst, as.matrix(iris[, -5]), iterationrange = c(1, 1))
   expect_equal(mpred, mpred1)
 
   d <- cbind(
@@ -190,7 +190,7 @@ test_that("train and predict softprob", {
     data = dtrain, nrounds = 4, num_class = 10,
     objective = "multi:softprob"
   )
-  predt <- predict(booster, as.matrix(d), reshape = TRUE, strict_shape = FALSE)
+  predt <- predict(booster, as.matrix(d), strict_shape = FALSE)
   expect_equal(ncol(predt), 10)
   expect_equal(rowSums(predt), rep(1, 100), tolerance = 1e-7)
 })
@@ -254,13 +254,13 @@ test_that("train and predict RF with softprob", {
   )
   expect_equal(xgb.get.num.boosted.rounds(bst), 15)
   # predict for all iterations:
-  pred <- predict(bst, as.matrix(iris[, -5]), reshape = TRUE)
+  pred <- predict(bst, as.matrix(iris[, -5]))
   expect_equal(dim(pred), c(nrow(iris), 3))
   pred_labels <- max.col(pred) - 1
   err <- sum(pred_labels != lb) / length(lb)
   expect_equal(attributes(bst)$evaluation_log[nrounds, train_merror], err, tolerance = 5e-6)
   # predict for 7 iterations and adjust for 4 parallel trees per iteration
-  pred <- predict(bst, as.matrix(iris[, -5]), reshape = TRUE, iterationrange = c(1, 7))
+  pred <- predict(bst, as.matrix(iris[, -5]), iterationrange = c(1, 7))
   err <- sum((max.col(pred) - 1) != lb) / length(lb)
   expect_equal(attributes(bst)$evaluation_log[7, train_merror], err, tolerance = 5e-6)
 })
@@ -334,7 +334,7 @@ test_that("xgb.cv works", {
   set.seed(11)
   expect_output(
     cv <- xgb.cv(
-      data = train$data, label = train$label, max_depth = 2, nfold = 5,
+      data = xgb.DMatrix(train$data, label = train$label), max_depth = 2, nfold = 5,
       eta = 1., nthread = n_threads, nrounds = 2, objective = "binary:logistic",
       eval_metric = "error", verbose = TRUE
     ),
@@ -357,13 +357,13 @@ test_that("xgb.cv works with stratified folds", {
   cv <- xgb.cv(
     data = dtrain, max_depth = 2, nfold = 5,
     eta = 1., nthread = n_threads, nrounds = 2, objective = "binary:logistic",
-    verbose = TRUE, stratified = FALSE
+    verbose = FALSE, stratified = FALSE
   )
   set.seed(314159)
   cv2 <- xgb.cv(
     data = dtrain, max_depth = 2, nfold = 5,
     eta = 1., nthread = n_threads, nrounds = 2, objective = "binary:logistic",
-    verbose = TRUE, stratified = TRUE
+    verbose = FALSE, stratified = TRUE
   )
   # Stratified folds should result in a different evaluation logs
   expect_true(all(cv$evaluation_log[, test_logloss_mean] != cv2$evaluation_log[, test_logloss_mean]))
@@ -485,15 +485,25 @@ test_that("strict_shape works", {
     n_rows <- nrow(X)
     n_cols <- ncol(X)
 
-    expect_equal(dim(predt), c(n_groups, n_rows))
-    expect_equal(dim(margin), c(n_groups, n_rows))
-    expect_equal(dim(contri), c(n_cols + 1, n_groups, n_rows))
-    expect_equal(dim(interact), c(n_cols + 1, n_cols + 1, n_groups, n_rows))
-    expect_equal(dim(leaf), c(1, n_groups, n_rounds, n_rows))
+    expect_equal(dim(predt), c(n_rows, n_groups))
+    expect_equal(dim(margin), c(n_rows, n_groups))
+    expect_equal(dim(contri), c(n_rows, n_groups, n_cols + 1))
+    expect_equal(dim(interact), c(n_rows, n_groups, n_cols + 1, n_cols + 1))
+    expect_equal(dim(leaf), c(n_rows, n_rounds, n_groups, 1))
 
     if (n_groups != 1) {
       for (g in seq_len(n_groups)) {
-        expect_lt(max(abs(colSums(contri[, g, ]) - margin[g, ])), 1e-5)
+        expect_lt(max(abs(rowSums(contri[, g, ]) - margin[, g])), 1e-5)
+      }
+
+      leaf_no_strict <- predict(bst, X, strict_shape = FALSE, predleaf = TRUE)
+      for (g in seq_len(n_groups)) {
+        g_mask <- rep(FALSE, n_groups)
+        g_mask[g] <- TRUE
+        expect_equal(
+          leaf[, , g, 1L],
+          leaf_no_strict[, g_mask]
+        )
       }
     }
   }
@@ -562,7 +572,7 @@ test_that("Quantile regression accepts multiple quantiles", {
     ),
     nrounds = 15
   )
-  pred <- predict(model, x, reshape = TRUE)
+  pred <- predict(model, x)
 
   expect_equal(dim(pred)[1], nrow(x))
   expect_equal(dim(pred)[2], 3)
@@ -590,7 +600,7 @@ test_that("Can use multi-output labels with built-in objectives", {
     data = dm,
     nrounds = 5
   )
-  pred <- predict(model, x, reshape = TRUE)
+  pred <- predict(model, x)
   expect_equal(pred[, 1], -pred[, 2])
   expect_true(cor(y, pred[, 1]) > 0.9)
   expect_true(cor(y, pred[, 2]) < -0.9)
@@ -619,7 +629,7 @@ test_that("Can use multi-output labels with custom objectives", {
     data = dm,
     nrounds = 5
   )
-  pred <- predict(model, x, reshape = TRUE)
+  pred <- predict(model, x)
   expect_equal(pred[, 1], -pred[, 2])
   expect_true(cor(y, pred[, 1]) > 0.9)
   expect_true(cor(y, pred[, 2]) < -0.9)
@@ -666,9 +676,9 @@ test_that("Can predict on data.frame objects", {
     nrounds = 5
   )
 
-  pred_mat <- predict(model, xgb.DMatrix(x_mat), nthread = n_threads)
-  pred_df <- predict(model, x_df, nthread = n_threads)
-  expect_equal(pred_mat, pred_df)
+  pred_mat <- predict(model, xgb.DMatrix(x_mat))
+  pred_df <- predict(model, x_df)
+  expect_equal(pred_mat, unname(pred_df))
 })
 
 test_that("'base_margin' gives the same result in DMatrix as in inplace_predict", {
@@ -692,7 +702,7 @@ test_that("'base_margin' gives the same result in DMatrix as in inplace_predict"
   pred_from_dm <- predict(model, dm_w_base)
   pred_from_mat <- predict(model, x, base_margin = base_margin)
 
-  expect_equal(pred_from_dm, pred_from_mat)
+  expect_equal(pred_from_dm, unname(pred_from_mat))
 })
 
 test_that("Coefficients from gblinear have the expected shape and names", {
@@ -715,7 +725,7 @@ test_that("Coefficients from gblinear have the expected shape and names", {
   expect_equal(names(coefs), c("(Intercept)", colnames(x)))
   pred_auto <- predict(model, x)
   pred_manual <- as.numeric(mm %*% coefs)
-  expect_equal(pred_manual, pred_auto, tolerance = 1e-5)
+  expect_equal(pred_manual, unname(pred_auto), tolerance = 1e-5)
 
   # Multi-column coefficients
   data(iris)
@@ -737,9 +747,22 @@ test_that("Coefficients from gblinear have the expected shape and names", {
   expect_equal(nrow(coefs), ncol(x) + 1)
   expect_equal(ncol(coefs), 3)
   expect_equal(row.names(coefs), c("(Intercept)", colnames(x)))
-  pred_auto <- predict(model, x, outputmargin = TRUE, reshape = TRUE)
+  pred_auto <- predict(model, x, outputmargin = TRUE)
   pred_manual <- unname(mm %*% coefs)
   expect_equal(pred_manual, pred_auto, tolerance = 1e-7)
+
+  # xgboost() with additional metadata
+  model <- xgboost(
+    iris[, -5],
+    iris$Species,
+    booster = "gblinear",
+    objective = "multi:softprob",
+    nrounds = 3,
+    nthread = 1
+  )
+  coefs <- coef(model)
+  expect_equal(row.names(coefs), c("(Intercept)", colnames(x)))
+  expect_equal(colnames(coefs), levels(iris$Species))
 })
 
 test_that("Deep copies work as expected", {
@@ -884,4 +907,102 @@ test_that("Seed in params override PRNG from R", {
       )
     )
   )
+})
+
+test_that("xgb.cv works for AFT", {
+  X <- matrix(c(1, -1, -1, 1, 0, 1, 1, 0), nrow = 4, byrow = TRUE)  # 4x2 matrix
+  dtrain <- xgb.DMatrix(X, nthread = n_threads)
+
+  params <- list(objective = 'survival:aft', learning_rate = 0.2, max_depth = 2L)
+
+  # data must have bounds
+  expect_error(
+    xgb.cv(
+      params = params,
+      data = dtrain,
+      nround = 5L,
+      nfold = 4L,
+      nthread = n_threads
+    )
+  )
+
+  setinfo(dtrain, 'label_lower_bound', c(2, 3, 0, 4))
+  setinfo(dtrain, 'label_upper_bound', c(2, Inf, 4, 5))
+
+  # automatic stratified splitting is turned off
+  expect_warning(
+    xgb.cv(
+      params = params, data = dtrain, nround = 5L, nfold = 4L,
+      nthread = n_threads, stratified = TRUE, verbose = FALSE
+    )
+  )
+
+  # this works without any issue
+  expect_no_warning(
+    xgb.cv(params = params, data = dtrain, nround = 5L, nfold = 4L, verbose = FALSE)
+  )
+})
+
+test_that("xgb.cv works for ranking", {
+  data(iris)
+  x <- iris[, -(4:5)]
+  y <- as.integer(iris$Petal.Width)
+  group <- rep(50, 3)
+  dm <- xgb.DMatrix(x, label = y, group = group)
+  res <- xgb.cv(
+    data = dm,
+    params = list(
+      objective = "rank:pairwise",
+      max_depth = 3
+    ),
+    nrounds = 3,
+    nfold = 2,
+    verbose = FALSE,
+    stratified = FALSE
+  )
+  expect_equal(length(res$folds), 2L)
+})
+
+test_that("Row names are preserved in outputs", {
+  data(iris)
+  x <- iris[, -5]
+  y <- as.numeric(iris$Species) - 1
+  dm <- xgb.DMatrix(x, label = y, nthread = 1)
+  model <- xgb.train(
+    data = dm,
+    params = list(
+      objective = "multi:softprob",
+      num_class = 3,
+      max_depth = 2,
+      nthread = 1
+    ),
+    nrounds = 3
+  )
+  row.names(x) <- paste0("r", seq(1, nrow(x)))
+  pred <- predict(model, x)
+  expect_equal(row.names(pred), row.names(x))
+  pred <- predict(model, x, avoid_transpose = TRUE)
+  expect_equal(colnames(pred), row.names(x))
+
+  data(mtcars)
+  y <- mtcars[, 1]
+  x <- as.matrix(mtcars[, -1])
+  dm <- xgb.DMatrix(data = x, label = y)
+  model <- xgb.train(
+    data = dm,
+    params = list(
+      max_depth = 2,
+      nthread = 1
+    ),
+    nrounds = 3
+  )
+  row.names(x) <- paste0("r", seq(1, nrow(x)))
+  pred <- predict(model, x)
+  expect_equal(names(pred), row.names(x))
+  pred <- predict(model, x, avoid_transpose = TRUE)
+  expect_equal(names(pred), row.names(x))
+  pred <- predict(model, x, predleaf = TRUE)
+  expect_equal(row.names(pred), row.names(x))
+  pred <- predict(model, x, predleaf = TRUE, avoid_transpose = TRUE)
+  expect_equal(colnames(pred), row.names(x))
 })

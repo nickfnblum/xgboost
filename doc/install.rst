@@ -27,6 +27,26 @@ Pre-built binary wheels are uploaded to PyPI (Python Package Index) for each rel
 You might need to run the command with ``--user`` flag or use ``virtualenv`` if you run
 into permission errors.
 
+.. note:: Parts of the Python package now require glibc 2.28+
+
+  Starting from 2.1.0, XGBoost Python package will be distributed in two variants:
+
+  * ``manylinux_2_28``: for recent Linux distros with glibc 2.28 or newer. This variant comes with all features enabled.
+  * ``manylinux2014``: for old Linux distros with glibc older than 2.28. This variant does not support GPU algorithms or federated learning.
+
+  The ``pip`` package manager will automatically choose the correct variant depending on your system.
+
+  Starting from **May 31, 2025**, we will stop distributing the ``manylinux2014`` variant and exclusively
+  distribute the ``manylinux_2_28`` variant. We made this decision so that our CI/CD pipeline won't have
+  depend on software components that reached end-of-life (such as CentOS 7). We strongly encourage
+  everyone to migrate to recent Linux distros in order to use future versions of XGBoost.
+
+  Note. If you want to use GPU algorithms or federated learning on an older Linux distro, you have
+  two alternatives:
+
+  1. Upgrade to a recent Linux distro with glibc 2.28+.  OR
+  2. Build XGBoost from the source.
+
 .. note:: Windows users need to install Visual C++ Redistributable
 
   XGBoost requires DLLs from `Visual C++ Redistributable
@@ -56,6 +76,19 @@ Capabilities of binary wheels for each platform:
 | Windows             | |tick|  |  |cross|             |
 +---------------------+---------+----------------------+
 
+Minimal installation (CPU-only)
+*******************************
+The default installation with ``pip`` will install the full XGBoost package, including the support for the GPU algorithms and federated learning.
+
+You may choose to reduce the size of the installed package and save the disk space, by opting to install ``xgboost-cpu`` instead:
+
+.. code-block:: bash
+
+  pip install xgboost-cpu
+
+The ``xgboost-cpu`` variant will have drastically smaller disk footprint, but does not provide some features, such as the GPU algorithms and
+federated learning.
+
 Conda
 *****
 
@@ -74,6 +107,13 @@ Conda should be able to detect the existence of a GPU on your machine and instal
    # Use NVIDIA GPU
    conda install -c conda-forge py-xgboost-gpu
 
+To force the installation of the GPU variant on a machine that does not have an NVIDIA GPU, use environment variable ``CONDA_OVERRIDE_CUDA``,
+as described in `"Managing Virtual Packages" in the conda docs <https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-virtual.html>`_.
+
+.. code-block:: bash
+
+  export CONDA_OVERRIDE_CUDA="12.5"
+  conda install -c conda-forge py-xgboost-gpu
 
 Visit the `Miniconda website <https://docs.conda.io/en/latest/miniconda.html>`_ to obtain Conda.
 
@@ -119,7 +159,7 @@ R
 JVM
 ---
 
-* XGBoost4j/XGBoost4j-Spark
+* XGBoost4j-Spark
 
 .. code-block:: xml
   :caption: Maven
@@ -132,11 +172,6 @@ JVM
 
   <dependencies>
     ...
-    <dependency>
-        <groupId>ml.dmlc</groupId>
-        <artifactId>xgboost4j_${scala.binary.version}</artifactId>
-        <version>latest_version_num</version>
-    </dependency>
     <dependency>
         <groupId>ml.dmlc</groupId>
         <artifactId>xgboost4j-spark_${scala.binary.version}</artifactId>
@@ -148,11 +183,10 @@ JVM
   :caption: sbt
 
   libraryDependencies ++= Seq(
-    "ml.dmlc" %% "xgboost4j" % "latest_version_num",
     "ml.dmlc" %% "xgboost4j-spark" % "latest_version_num"
   )
 
-* XGBoost4j-GPU/XGBoost4j-Spark-GPU
+* XGBoost4j-Spark-GPU
 
 .. code-block:: xml
   :caption: Maven
@@ -167,11 +201,6 @@ JVM
     ...
     <dependency>
         <groupId>ml.dmlc</groupId>
-        <artifactId>xgboost4j-gpu_${scala.binary.version}</artifactId>
-        <version>latest_version_num</version>
-    </dependency>
-    <dependency>
-        <groupId>ml.dmlc</groupId>
         <artifactId>xgboost4j-spark-gpu_${scala.binary.version}</artifactId>
         <version>latest_version_num</version>
     </dependency>
@@ -181,7 +210,6 @@ JVM
   :caption: sbt
 
   libraryDependencies ++= Seq(
-    "ml.dmlc" %% "xgboost4j-gpu" % "latest_version_num",
     "ml.dmlc" %% "xgboost4j-spark-gpu" % "latest_version_num"
   )
 
@@ -189,7 +217,7 @@ This will check out the latest stable version from the Maven Central.
 
 For the latest release version number, please check `release page <https://github.com/dmlc/xgboost/releases>`_.
 
-To enable the GPU algorithm (``device='cuda'``), use artifacts ``xgboost4j-gpu_2.12`` and ``xgboost4j-spark-gpu_2.12`` instead (note the ``gpu`` suffix).
+To enable the GPU algorithm (``device='cuda'``), use artifacts ``xgboost4j-spark-gpu_2.12`` instead (note the ``gpu`` suffix).
 
 
 .. note:: Windows not supported in the JVM package
@@ -252,7 +280,7 @@ JVM
 
   resolvers += "XGBoost4J Snapshot Repo" at "https://s3-us-west-2.amazonaws.com/xgboost-maven-repo/snapshot/"
 
-Then add XGBoost4J as a dependency:
+Then add XGBoost4J-Spark as a dependency:
 
 .. code-block:: xml
   :caption: maven
@@ -264,12 +292,6 @@ Then add XGBoost4J as a dependency:
   </properties>
 
   <dependencies>
-    ...
-    <dependency>
-        <groupId>ml.dmlc</groupId>
-        <artifactId>xgboost4j_${scala.binary.version}</artifactId>
-        <version>latest_version_num-SNAPSHOT</version>
-    </dependency>
     <dependency>
         <groupId>ml.dmlc</groupId>
         <artifactId>xgboost4j-spark_${scala.binary.version}</artifactId>
@@ -281,11 +303,10 @@ Then add XGBoost4J as a dependency:
   :caption: sbt
 
   libraryDependencies ++= Seq(
-    "ml.dmlc" %% "xgboost4j" % "latest_version_num-SNAPSHOT",
     "ml.dmlc" %% "xgboost4j-spark" % "latest_version_num-SNAPSHOT"
   )
 
-* XGBoost4j-GPU/XGBoost4j-Spark-GPU
+* XGBoost4j-Spark-GPU
 
 .. code-block:: xml
   :caption: maven
@@ -297,12 +318,6 @@ Then add XGBoost4J as a dependency:
   </properties>
 
   <dependencies>
-    ...
-    <dependency>
-        <groupId>ml.dmlc</groupId>
-        <artifactId>xgboost4j-gpu_${scala.binary.version}</artifactId>
-        <version>latest_version_num-SNAPSHOT</version>
-    </dependency>
     <dependency>
         <groupId>ml.dmlc</groupId>
         <artifactId>xgboost4j-spark-gpu_${scala.binary.version}</artifactId>
@@ -314,7 +329,6 @@ Then add XGBoost4J as a dependency:
   :caption: sbt
 
   libraryDependencies ++= Seq(
-    "ml.dmlc" %% "xgboost4j-gpu" % "latest_version_num-SNAPSHOT",
     "ml.dmlc" %% "xgboost4j-spark-gpu" % "latest_version_num-SNAPSHOT"
   )
 

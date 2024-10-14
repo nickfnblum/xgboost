@@ -53,12 +53,6 @@ def build_libxgboost(
         ]
         cmake_cmd.extend(build_config.get_cmake_args())
 
-        # Flag for cross-compiling for Apple Silicon
-        # We use environment variable because it's the only way to pass down custom
-        # flags through the cibuildwheel package, which calls `pip wheel` command.
-        if "CIBW_TARGET_OSX_ARM64" in os.environ:
-            cmake_cmd.append("-DCMAKE_OSX_ARCHITECTURES=arm64")
-
         logger.info("CMake args: %s", str(cmake_cmd))
         subprocess.check_call(cmake_cmd, cwd=build_dir)
 
@@ -144,6 +138,9 @@ def locate_or_build_libxgboost(
             sys_prefix / "Library",
             sys_prefix / "Library" / "bin",
             sys_prefix / "Library" / "lib",
+            sys_prefix / "Library" / "mingw-w64",
+            sys_prefix / "Library" / "mingw-w64" / "bin",
+            sys_prefix / "Library" / "mingw-w64" / "lib",
         ]
         sys_prefix_candidates = [
             p.expanduser().resolve() for p in sys_prefix_candidates
