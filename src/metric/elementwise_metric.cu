@@ -10,25 +10,25 @@
 
 #include <array>
 #include <cmath>
+#include <numeric>  // for accumulate
 
-#include "../collective/communicator-inl.h"
-#include "../common/common.h"  // MetricNoCache
 #include "../common/math.h"
 #include "../common/optional_weight.h"  // OptionalWeights
 #include "../common/pseudo_huber.h"
 #include "../common/quantile_loss_utils.h"  // QuantileLossParam
 #include "../common/threading_utils.h"
-#include "metric_common.h"
+#include "metric_common.h"              // MetricNoCache
 #include "xgboost/collective/result.h"  // for SafeColl
 #include "xgboost/metric.h"
 
 #if defined(XGBOOST_USE_CUDA)
-#include <thrust/execution_policy.h>  // thrust::cuda::par
 #include <thrust/functional.h>        // thrust::plus<>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform_reduce.h>
 
-#include "../common/device_helpers.cuh"
+#include "../common/cuda_context.cuh"  // for CUDAContext
+#else
+#include "../common/common.h"  // for AssertGPUSupport
 #endif  // XGBOOST_USE_CUDA
 
 namespace xgboost::metric {
@@ -48,11 +48,10 @@ PackedReduceResult Reduce(Context const* ctx, MetaInfo const& info, Fn&& loss) {
   auto labels = info.labels.View(ctx->Device());
   if (ctx->IsCUDA()) {
 #if defined(XGBOOST_USE_CUDA)
-    dh::XGBCachingDeviceAllocator<char> alloc;
     thrust::counting_iterator<size_t> begin(0);
     thrust::counting_iterator<size_t> end = begin + labels.Size();
     result = thrust::transform_reduce(
-        thrust::cuda::par(alloc), begin, end,
+        ctx->CUDACtx()->CTP(), begin, end,
         [=] XGBOOST_DEVICE(size_t i) {
           auto idx = linalg::UnravelIndex(i, labels.Shape());
           auto sample_id = std::get<0>(idx);

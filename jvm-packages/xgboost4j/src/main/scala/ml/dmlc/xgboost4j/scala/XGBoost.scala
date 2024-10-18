@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -17,11 +17,13 @@
 package ml.dmlc.xgboost4j.scala
 
 import java.io.InputStream
-import ml.dmlc.xgboost4j.java.{XGBoostError, XGBoost => JXGBoost}
 
 import scala.jdk.CollectionConverters._
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
+
+import ml.dmlc.xgboost4j.java.{XGBoost => JXGBoost, XGBoostError}
 
 /**
   * XGBoost Scala Training function.
@@ -196,5 +198,3 @@ private[scala] object ExternalCheckpointParams {
     }
   }
 }
-
-

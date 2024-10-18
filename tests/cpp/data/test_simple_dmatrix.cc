@@ -1,5 +1,5 @@
 /**
- * Copyright 2016-2023 by XGBoost Contributors
+ * Copyright 2016-2024, XGBoost Contributors
  */
 #include <xgboost/data.h>
 
@@ -9,6 +9,7 @@
 
 #include "../../../src/data/adapter.h"         // ArrayAdapter
 #include "../../../src/data/simple_dmatrix.h"  // SimpleDMatrix
+#include "../collective/test_worker.h"         // for TestDistributedGlobal
 #include "../filesystem.h"                     // dmlc::TemporaryDirectory
 #include "../helpers.h"                        // RandomDataGenerator,CreateSimpleTestData
 #include "xgboost/base.h"
@@ -223,7 +224,7 @@ TEST(SimpleDMatrix, FromFile) {
     auto batch = page.GetView();
     EXPECT_EQ(batch.Size(), kExpectedNumRow);
     EXPECT_EQ(page.offset.HostVector(),
-              std::vector<bst_row_t>({0, 3, 6, 9, 12, 15, 15}));
+              std::vector<bst_idx_t>({0, 3, 6, 9, 12, 15, 15}));
     EXPECT_EQ(page.base_rowid, 0);
 
     for (auto i = 0ull; i < batch.Size() - 1; i++) {
@@ -433,16 +434,15 @@ namespace {
 void VerifyColumnSplit() {
   size_t constexpr kRows {16};
   size_t constexpr kCols {8};
-  auto dmat =
-      RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix(false, false, 1, DataSplitMode::kCol);
+  auto p_fmat = RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix(false, DataSplitMode::kCol);
 
-  ASSERT_EQ(dmat->Info().num_col_, kCols * collective::GetWorldSize());
-  ASSERT_EQ(dmat->Info().num_row_, kRows);
-  ASSERT_EQ(dmat->Info().data_split_mode, DataSplitMode::kCol);
+  ASSERT_EQ(p_fmat->Info().num_col_, kCols * collective::GetWorldSize());
+  ASSERT_EQ(p_fmat->Info().num_row_, kRows);
+  ASSERT_EQ(p_fmat->Info().data_split_mode, DataSplitMode::kCol);
 }
 }  // anonymous namespace
 
 TEST(SimpleDMatrix, ColumnSplit) {
   auto constexpr kWorldSize{3};
-  RunWithInMemoryCommunicator(kWorldSize, VerifyColumnSplit);
+  collective::TestDistributedGlobal(kWorldSize, VerifyColumnSplit);
 }

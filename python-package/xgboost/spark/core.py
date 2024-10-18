@@ -347,15 +347,14 @@ class _SparkXGBParams(
                 predict_params[param.name] = self.getOrDefault(param)
         return predict_params
 
-    def _validate_gpu_params(self) -> None:
+    def _validate_gpu_params(
+        self, spark_version: str, conf: SparkConf, is_local: bool = False
+    ) -> None:
         """Validate the gpu parameters and gpu configurations"""
 
         if self._run_on_gpu():
-            ss = _get_spark_session()
-            sc = ss.sparkContext
-
-            if _is_local(sc):
-                # Support GPU training in Spark local mode is just for debugging
+            if is_local:
+                # Supporting GPU training in Spark local mode is just for debugging
                 # purposes, so it's okay for printing the below warning instead of
                 # checking the real gpu numbers and raising the exception.
                 get_logger(self.__class__.__name__).warning(
@@ -364,33 +363,41 @@ class _SparkXGBParams(
                     self.getOrDefault(self.num_workers),
                 )
             else:
-                executor_gpus = sc.getConf().get("spark.executor.resource.gpu.amount")
+                executor_gpus = conf.get("spark.executor.resource.gpu.amount")
                 if executor_gpus is None:
                     raise ValueError(
                         "The `spark.executor.resource.gpu.amount` is required for training"
                         " on GPU."
                     )
-
-                if not (
-                    ss.version >= "3.4.0"
-                    and _is_standalone_or_localcluster(sc.getConf())
+                gpu_per_task = conf.get("spark.task.resource.gpu.amount")
+                if gpu_per_task is not None and float(gpu_per_task) > 1.0:
+                    get_logger(self.__class__.__name__).warning(
+                        "The configuration assigns %s GPUs to each Spark task, but each "
+                        "XGBoost training task only utilizes 1 GPU, which will lead to "
+                        "unnecessary GPU waste",
+                        gpu_per_task,
+                    )
+                # For 3.5.1+, Spark supports task stage-level scheduling for
+                #                          Yarn/K8s/Standalone/Local cluster
+                # From 3.4.0 ~ 3.5.0, Spark only supports task stage-level scheduing for
+                #                           Standalone/Local cluster
+                # For spark below 3.4.0, Task stage-level scheduling is not supported.
+                #
+                # With stage-level scheduling, spark.task.resource.gpu.amount is not required
+                # to be set explicitly. Or else, spark.task.resource.gpu.amount is a must-have and
+                # must be set to 1.0
+                if spark_version < "3.4.0" or (
+                    "3.4.0" <= spark_version < "3.5.1"
+                    and not _is_standalone_or_localcluster(conf)
                 ):
-                    # We will enable stage-level scheduling in spark 3.4.0+ which doesn't
-                    # require spark.task.resource.gpu.amount to be set explicitly
-                    gpu_per_task = sc.getConf().get("spark.task.resource.gpu.amount")
                     if gpu_per_task is not None:
                         if float(gpu_per_task) < 1.0:
                             raise ValueError(
-                                "XGBoost doesn't support GPU fractional configurations. "
-                                "Please set `spark.task.resource.gpu.amount=spark.executor"
-                                ".resource.gpu.amount`"
-                            )
-
-                        if float(gpu_per_task) > 1.0:
-                            get_logger(self.__class__.__name__).warning(
-                                "%s GPUs for each Spark task is configured, but each "
-                                "XGBoost training task uses only 1 GPU.",
-                                gpu_per_task,
+                                "XGBoost doesn't support GPU fractional configurations. Please set "
+                                "`spark.task.resource.gpu.amount=spark.executor.resource.gpu."
+                                "amount`. To enable GPU fractional configurations, you can try "
+                                "standalone/localcluster with spark 3.4.0+ and"
+                                "YARN/K8S with spark 3.5.1+"
                             )
                     else:
                         raise ValueError(
@@ -475,7 +482,9 @@ class _SparkXGBParams(
                     "`pyspark.ml.linalg.Vector` type."
                 )
 
-        self._validate_gpu_params()
+        ss = _get_spark_session()
+        sc = ss.sparkContext
+        self._validate_gpu_params(ss.version, sc.getConf(), _is_local(sc))
 
     def _run_on_gpu(self) -> bool:
         """If train or transform on the gpu according to the parameters"""
@@ -518,7 +527,8 @@ def _validate_and_convert_feature_col_as_array_col(
             (DoubleType, FloatType, LongType, IntegerType, ShortType),
         ):
             raise ValueError(
-                "If feature column is array type, its elements must be number type."
+                "If feature column is array type, its elements must be number type, "
+                f"got {features_col_datatype.elementType}."
             )
         features_array_col = features_col.cast(ArrayType(FloatType())).alias(alias.data)
     elif isinstance(features_col_datatype, VectorUDT):
@@ -681,50 +691,15 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         sklearn_model._Booster.load_config(config)
         return sklearn_model
 
-    def _query_plan_contains_valid_repartition(self, dataset: DataFrame) -> bool:
-        """
-        Returns true if the latest element in the logical plan is a valid repartition
-        The logic plan string format is like:
-
-        == Optimized Logical Plan ==
-        Repartition 4, true
-        +- LogicalRDD [features#12, label#13L], false
-
-        i.e., the top line in the logical plan is the last operation to execute.
-        so, in this method, we check the first line, if it is a "Repartition" operation,
-        and the result dataframe has the same partition number with num_workers param,
-        then it means the dataframe is well repartitioned and we don't need to
-        repartition the dataframe again.
-        """
-        num_partitions = dataset.rdd.getNumPartitions()
-        assert dataset._sc._jvm is not None
-        query_plan = dataset._sc._jvm.PythonSQLUtils.explainString(
-            dataset._jdf.queryExecution(), "extended"
-        )
-        start = query_plan.index("== Optimized Logical Plan ==")
-        start += len("== Optimized Logical Plan ==") + 1
-        num_workers = self.getOrDefault(self.num_workers)
-        if (
-            query_plan[start : start + len("Repartition")] == "Repartition"
-            and num_workers == num_partitions
-        ):
-            return True
-        return False
-
     def _repartition_needed(self, dataset: DataFrame) -> bool:
         """
         We repartition the dataset if the number of workers is not equal to the number of
-        partitions. There is also a check to make sure there was "active partitioning"
-        where either Round Robin or Hash partitioning was actively used before this stage.
-        """
+        partitions."""
         if self.getOrDefault(self.force_repartition):
             return True
-        try:
-            if self._query_plan_contains_valid_repartition(dataset):
-                return False
-        except Exception:  # pylint: disable=broad-except
-            pass
-        return True
+        num_workers = self.getOrDefault(self.num_workers)
+        num_partitions = dataset.rdd.getNumPartitions()
+        return not num_workers == num_partitions
 
     def _get_distributed_train_params(self, dataset: DataFrame) -> Dict[str, Any]:
         """
@@ -861,14 +836,10 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
                 num_workers,
             )
 
-        if self._repartition_needed(dataset) or (
-            self.isDefined(self.validationIndicatorCol)
-            and self.getOrDefault(self.validationIndicatorCol) != ""
-        ):
-            # If validationIndicatorCol defined, we always repartition dataset
-            # to balance data, because user might unionise train and validation dataset,
-            # without shuffling data then some partitions might contain only train or validation
-            # dataset.
+        if self._repartition_needed(dataset):
+            # If validationIndicatorCol defined, and if user unionise train and validation
+            # dataset, users must set force_repartition to true to force repartition.
+            # Or else some partitions might contain only train or validation dataset.
             if self.getOrDefault(self.repartition_random_shuffle):
                 # In some cases, spark round-robin repartition might cause data skew
                 # use random shuffle can address it.
@@ -925,10 +896,14 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
                 )
                 return True
 
-            if not _is_standalone_or_localcluster(conf):
+            if (
+                "3.4.0" <= spark_version < "3.5.1"
+                and not _is_standalone_or_localcluster(conf)
+            ):
                 self.logger.info(
-                    "Stage-level scheduling in xgboost requires spark standalone or "
-                    "local-cluster mode"
+                    "For %s, Stage-level scheduling in xgboost requires spark standalone "
+                    "or local-cluster mode",
+                    spark_version,
                 )
                 return True
 
@@ -980,7 +955,9 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         """Try to enable stage-level scheduling"""
         ss = _get_spark_session()
         conf = ss.sparkContext.getConf()
-        if self._skip_stage_level_scheduling(ss.version, conf):
+        if _is_local(ss.sparkContext) or self._skip_stage_level_scheduling(
+            ss.version, conf
+        ):
             return rdd
 
         # executor_cores will not be None
@@ -1051,7 +1028,11 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             context = BarrierTaskContext.get()
 
             dev_ordinal = None
-            use_qdm = _can_use_qdm(booster_params.get("tree_method", None))
+            use_qdm = _can_use_qdm(
+                booster_params.get("tree_method", None),
+                booster_params.get("device", None),
+            )
+            verbosity = booster_params.get("verbosity", 1)
             msg = "Training on CPUs"
             if run_on_gpu:
                 dev_ordinal = (
@@ -1089,15 +1070,16 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
 
             evals_result: Dict[str, Any] = {}
             with CommunicatorContext(context, **_rabit_args):
-                dtrain, dvalid = create_dmatrix_from_partitions(
-                    pandas_df_iter,
-                    feature_prop.features_cols_names,
-                    dev_ordinal,
-                    use_qdm,
-                    dmatrix_kwargs,
-                    enable_sparse_data_optim=feature_prop.enable_sparse_data_optim,
-                    has_validation_col=feature_prop.has_validation_col,
-                )
+                with xgboost.config_context(verbosity=verbosity):
+                    dtrain, dvalid = create_dmatrix_from_partitions(
+                        iterator=pandas_df_iter,
+                        feature_cols=feature_prop.features_cols_names,
+                        dev_ordinal=dev_ordinal,
+                        use_qdm=use_qdm,
+                        kwargs=dmatrix_kwargs,
+                        enable_sparse_data_optim=feature_prop.enable_sparse_data_optim,
+                        has_validation_col=feature_prop.has_validation_col,
+                    )
                 if dvalid is not None:
                     dval = [(dtrain, "training"), (dvalid, "validation")]
                 else:
@@ -1362,15 +1344,15 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
         # to avoid the `self` object to be pickled to remote.
         xgb_sklearn_model = self._xgb_sklearn_model
 
-        has_base_margin = False
+        base_margin_col = None
         if (
             self.isDefined(self.base_margin_col)
             and self.getOrDefault(self.base_margin_col) != ""
         ):
-            has_base_margin = True
             base_margin_col = col(self.getOrDefault(self.base_margin_col)).alias(
                 alias.margin
             )
+        has_base_margin = base_margin_col is not None
 
         features_col, feature_col_names = self._get_feature_col(dataset)
         enable_sparse_data_optim = self.getOrDefault(self.enable_sparse_data_optim)
@@ -1455,6 +1437,7 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
                 yield predict_func(model, X, base_margin)
 
         if has_base_margin:
+            assert base_margin_col is not None
             pred_col = predict_udf(struct(*features_col, base_margin_col))
         else:
             pred_col = predict_udf(struct(*features_col))

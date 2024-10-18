@@ -1,7 +1,8 @@
 /**
- * Copyright 2017-2023 by XGBoost contributors
+ * Copyright 2017-2024 by XGBoost contributors
  */
 #ifndef XGBOOST_USE_CUDA
+#ifndef XGBOOST_USE_SYCL
 
 // dummy implementation of HostDeviceVector in case CUDA is not used
 
@@ -115,6 +116,11 @@ void HostDeviceVector<T>::Resize(size_t new_size, T v) {
 }
 
 template <typename T>
+void HostDeviceVector<T>::Resize(size_t new_size) {
+  impl_->Vec().resize(new_size, T{});
+}
+
+template <typename T>
 void HostDeviceVector<T>::Fill(T v) {
   std::fill(HostVector().begin(), HostVector().end(), v);
 }
@@ -178,7 +184,7 @@ template class HostDeviceVector<uint8_t>;
 template class HostDeviceVector<int8_t>;
 template class HostDeviceVector<FeatureType>;
 template class HostDeviceVector<Entry>;
-template class HostDeviceVector<uint64_t>;  // bst_row_t
+template class HostDeviceVector<bst_idx_t>;
 template class HostDeviceVector<uint32_t>;  // bst_feature_t
 
 #if defined(__APPLE__) || defined(__EMSCRIPTEN__)
@@ -197,4 +203,5 @@ template class HostDeviceVector<std::size_t>;
 
 }  // namespace xgboost
 
+#endif  // XGBOOST_USE_SYCL
 #endif  // XGBOOST_USE_CUDA

@@ -1,15 +1,21 @@
 /**
- * Copyright 2022-2023 by XGBoost Contributors
+ * Copyright 2022-2024, XGBoost Contributors
  */
 #include "threading_utils.h"
 
-#include <algorithm>   // for max
+#include <algorithm>   // for max, min
 #include <exception>   // for exception
 #include <filesystem>  // for path, exists
 #include <fstream>     // for ifstream
 #include <string>      // for string
 
 #include "common.h"  // for DivRoundUp
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sys/syscall.h>  // for SYS_getcpu
+#include <unistd.h>       // for syscall
+#endif
 
 namespace xgboost::common {
 /**
@@ -74,34 +80,74 @@ std::int32_t GetCGroupV2Count(std::filesystem::path const& bandwidth_path) noexc
 
 std::int32_t GetCfsCPUCount() noexcept {
   namespace fs = std::filesystem;
-  fs::path const bandwidth_path{"/sys/fs/cgroup/cpu.max"};
-  auto has_v2 = fs::exists(bandwidth_path);
-  if (has_v2) {
-    return GetCGroupV2Count(bandwidth_path);
+
+  try {
+    fs::path const bandwidth_path{"/sys/fs/cgroup/cpu.max"};
+    auto has_v2 = fs::exists(bandwidth_path);
+    if (has_v2) {
+      return GetCGroupV2Count(bandwidth_path);
+    }
+  } catch (std::exception const&) {
+    return -1;
   }
 
-  fs::path const quota_path{"/sys/fs/cgroup/cpu/cpu.cfs_quota_us"};
-  fs::path const peroid_path{"/sys/fs/cgroup/cpu/cpu.cfs_period_us"};
-  auto has_v1 = fs::exists(quota_path) && fs::exists(peroid_path);
-  if (has_v1) {
-    return GetCGroupV1Count(quota_path, peroid_path);
+  try {
+    fs::path const quota_path{"/sys/fs/cgroup/cpu/cpu.cfs_quota_us"};
+    fs::path const peroid_path{"/sys/fs/cgroup/cpu/cpu.cfs_period_us"};
+    auto has_v1 = fs::exists(quota_path) && fs::exists(peroid_path);
+    if (has_v1) {
+      return GetCGroupV1Count(quota_path, peroid_path);
+    }
+  } catch (std::exception const&) {
+    return -1;
   }
 
   return -1;
 }
 
-std::int32_t OmpGetNumThreads(std::int32_t n_threads) {
+std::int32_t OmpGetNumThreads(std::int32_t n_threads) noexcept(true) {
   // Don't use parallel if we are in a parallel region.
   if (omp_in_parallel()) {
     return 1;
   }
+  // Honor the openmp thread limit, which can be set via environment variable.
+  auto max_n_threads = std::min({omp_get_num_procs(), omp_get_max_threads(), OmpGetThreadLimit()});
   // If -1 or 0 is specified by the user, we default to maximum number of threads.
   if (n_threads <= 0) {
-    n_threads = std::min(omp_get_num_procs(), omp_get_max_threads());
+    n_threads = max_n_threads;
   }
-  // Honor the openmp thread limit, which can be set via environment variable.
-  n_threads = std::min(n_threads, OmpGetThreadLimit());
+  n_threads = std::min(n_threads, max_n_threads);
   n_threads = std::max(n_threads, 1);
   return n_threads;
+}
+
+[[nodiscard]] bool GetCpuNuma(unsigned int* cpu, unsigned int* numa) {
+#ifdef SYS_getcpu
+  return syscall(SYS_getcpu, cpu, numa, NULL) == 0;
+#else
+  return false;
+#endif
+}
+
+void NameThread(std::thread* t, StringView name) {
+#if defined(__linux__)
+  auto handle = t->native_handle();
+  char old[16];
+  auto ret = pthread_getname_np(handle, old, 16);
+  if (ret != 0) {
+    LOG(DEBUG) << "Failed to get the name from thread";
+  }
+  auto new_name = std::string{old} + ">" + name.c_str();  // NOLINT
+  if (new_name.size() > 15) {
+    new_name = new_name.substr(new_name.size() - 15);
+  }
+  ret = pthread_setname_np(handle, new_name.c_str());
+  if (ret != 0) {
+    LOG(DEBUG) << "Failed to name thread:" << ret << " :" << new_name;
+  }
+#else
+  (void)name;
+  (void)t;
+#endif
 }
 }  // namespace xgboost::common

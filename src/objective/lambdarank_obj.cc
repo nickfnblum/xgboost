@@ -314,7 +314,7 @@ class LambdaRankObj : public FitIntercept {
       CHECK_EQ(info.weights_.Size(), n_groups) << error::GroupWeight();
     }
 
-    if (ti_plus_.Size() == 0 && param_.lambdarank_unbiased) {
+    if ((ti_plus_.Empty() || li_full_.Empty()) && param_.lambdarank_unbiased) {
       CHECK_EQ(iter, 0);
       ti_plus_ = linalg::Constant<double>(ctx_, 1.0, p_cache_->MaxPositionSize());
       tj_minus_ = linalg::Constant<double>(ctx_, 1.0, p_cache_->MaxPositionSize());
@@ -344,7 +344,7 @@ class LambdaRankNDCG : public LambdaRankObj<LambdaRankNDCG, ltr::NDCGCache> {
                               common::Span<double const> discount, bst_group_t g) {
     auto delta = [&](auto y_high, auto y_low, std::size_t rank_high, std::size_t rank_low,
                      bst_group_t g) {
-      static_assert(std::is_floating_point<decltype(y_high)>::value);
+      static_assert(std::is_floating_point_v<decltype(y_high)>);
       return DeltaNDCG<exp_gain>(y_high, y_low, rank_high, rank_low, inv_IDCG(g), discount);
     };
     this->CalcLambdaForGroup<unbiased>(iter, g_predt, g_label, w, g_rank, g, delta, g_gpair);

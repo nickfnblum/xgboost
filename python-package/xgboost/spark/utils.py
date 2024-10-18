@@ -14,7 +14,8 @@ import pyspark
 from pyspark import BarrierTaskContext, SparkConf, SparkContext, SparkFiles, TaskContext
 from pyspark.sql.session import SparkSession
 
-from xgboost import Booster, XGBModel, collective
+from xgboost import Booster, XGBModel
+from xgboost.collective import CommunicatorContext as CCtx
 from xgboost.tracker import RabitTracker
 
 
@@ -42,35 +43,25 @@ def _get_default_params_from_func(
     return filtered_params_dict
 
 
-class CommunicatorContext:
-    """A context controlling collective communicator initialization and finalization.
-    This isn't specificially necessary (note Part 3), but it is more understandable
-    coding-wise.
-
-    """
+class CommunicatorContext(CCtx):  # pylint: disable=too-few-public-methods
+    """Context with PySpark specific task ID."""
 
     def __init__(self, context: BarrierTaskContext, **args: Any) -> None:
-        self.args = args
-        self.args["DMLC_TASK_ID"] = str(context.partitionId())
-
-    def __enter__(self) -> None:
-        collective.init(**self.args)
-
-    def __exit__(self, *args: Any) -> None:
-        collective.finalize()
+        args["dmlc_task_id"] = str(context.partitionId())
+        super().__init__(**args)
 
 
 def _start_tracker(context: BarrierTaskContext, n_workers: int) -> Dict[str, Any]:
     """Start Rabit tracker with n_workers"""
-    env: Dict[str, Any] = {"DMLC_NUM_WORKER": n_workers}
+    args: Dict[str, Any] = {"n_workers": n_workers}
     host = _get_host_ip(context)
-    rabit_context = RabitTracker(host_ip=host, n_workers=n_workers)
-    env.update(rabit_context.worker_envs())
-    rabit_context.start(n_workers)
-    thread = Thread(target=rabit_context.join)
+    tracker = RabitTracker(n_workers=n_workers, host_ip=host, sortby="task")
+    tracker.start()
+    thread = Thread(target=tracker.wait_for)
     thread.daemon = True
     thread.start()
-    return env
+    args.update(tracker.worker_args())
+    return args
 
 
 def _get_rabit_args(context: BarrierTaskContext, n_workers: int) -> Dict[str, Any]:

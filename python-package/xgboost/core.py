@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from enum import IntEnum, unique
 from functools import wraps
 from inspect import Parameter, signature
+from types import EllipsisType
 from typing import (
     Any,
     Callable,
@@ -25,6 +26,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeGuard,
     TypeVar,
     Union,
     cast,
@@ -52,6 +54,7 @@ from ._typing import (
     IterationRange,
     ModelIn,
     NumpyOrCupy,
+    PathLike,
     TransformedData,
     c_bst_ulong,
 )
@@ -189,6 +192,27 @@ def _register_log_callback(lib: ctypes.CDLL) -> None:
         raise XGBoostError(lib.XGBGetLastError())
 
 
+def _parse_version(ver: str) -> Tuple[Tuple[int, int, int], str]:
+    """Avoid dependency on packaging (PEP 440)."""
+    # 2.0.0-dev, 2.0.0, 2.0.0.post1, or 2.0.0rc1
+    if ver.find("post") != -1:
+        major, minor, patch = ver.split(".")[:-1]
+        postfix = ver.split(".")[-1]
+    elif "-dev" in ver:
+        major, minor, patch = ver.split("-")[0].split(".")
+        postfix = "dev"
+    else:
+        major, minor, patch = ver.split(".")
+        rc = patch.find("rc")
+        if rc != -1:
+            postfix = patch[rc:]
+            patch = patch[:rc]
+        else:
+            postfix = ""
+
+    return (int(major), int(minor), int(patch)), postfix
+
+
 def _load_lib() -> ctypes.CDLL:
     """Load xgboost Library."""
     lib_paths = find_lib_path()
@@ -236,17 +260,8 @@ Error message(s): {os_error_list}
         )
     _register_log_callback(lib)
 
-    def parse(ver: str) -> Tuple[int, int, int]:
-        """Avoid dependency on packaging (PEP 440)."""
-        # 2.0.0-dev, 2.0.0, or 2.0.0rc1
-        major, minor, patch = ver.split("-")[0].split(".")
-        rc = patch.find("rc")
-        if rc != -1:
-            patch = patch[:rc]
-        return int(major), int(minor), int(patch)
-
     libver = _lib_version(lib)
-    pyver = parse(_py_version())
+    pyver, _ = _parse_version(_py_version())
 
     # verify that we are loading the correct binary.
     if pyver != libver:
@@ -293,11 +308,12 @@ def _check_distributed_params(kwargs: Dict[str, Any]) -> None:
         raise TypeError(msg)
 
     if device and device.find(":") != -1:
-        raise ValueError(
-            "Distributed training doesn't support selecting device ordinal as GPUs are"
-            " managed by the distributed framework. use `device=cuda` or `device=gpu`"
-            " instead."
-        )
+        if device != "sycl:gpu":
+            raise ValueError(
+                "Distributed training doesn't support selecting device ordinal as GPUs are"
+                " managed by the distributed frameworks. use `device=cuda` or `device=gpu`"
+                " instead."
+            )
 
     if kwargs.get("booster", None) == "gblinear":
         raise NotImplementedError(
@@ -490,8 +506,8 @@ def _prediction_output(
 class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
     """The interface for user defined data iterator. The iterator facilitates
     distributed training, :py:class:`QuantileDMatrix`, and external memory support using
-    :py:class:`DMatrix`. Most of time, users don't need to interact with this class
-    directly.
+    :py:class:`DMatrix` or :py:class:`ExtMemQuantileDMatrix`. Most of time, users don't
+    need to interact with this class directly.
 
     .. note::
 
@@ -503,29 +519,63 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
     ----------
     cache_prefix :
         Prefix to the cache files, only used in external memory.
+
     release_data :
-        Whether the iterator should release the data during reset. Set it to True if the
-        data transformation (converting data to np.float32 type) is expensive.
+        Whether the iterator should release the data during iteration. Set it to True if
+        the data transformation (converting data to np.float32 type) is memory
+        intensive. Otherwise, if the transformation is computation intensive then we can
+        keep the cache.
+
+    on_host :
+        Whether the data should be cached on the host memory instead of the file system
+        when using GPU with external memory. When set to true (the default), the
+        "external memory" is the CPU (host) memory. See
+        :doc:`/tutorials/external_memory` for more info.
+
+        .. versionadded:: 3.0.0
+
+        .. warning::
+
+            This is an experimental parameter and subject to change.
+
+    min_cache_page_bytes :
+        The minimum number of bytes of each cached pages. Only used for on-host cache
+        with GPU-based :py:class:`ExtMemQuantileDMatrix`. When using GPU-based external
+        memory with the data cached in the host memory, XGBoost can concatenate the
+        pages internally to increase the batch size for the GPU. The default page size
+        is about 1/8 of the total device memory. Users can manually set the value based
+        on the actual hardware and datasets. Set this to 0 to disable page
+        concatenation.
+
+        .. versionadded:: 3.0.0
+
+        .. warning::
+
+            This is an experimental parameter and subject to change.
 
     """
 
     def __init__(
-        self, cache_prefix: Optional[str] = None, release_data: bool = True
+        self,
+        cache_prefix: Optional[str] = None,
+        release_data: bool = True,
+        *,
+        on_host: bool = True,
+        min_cache_page_bytes: Optional[int] = None,
     ) -> None:
         self.cache_prefix = cache_prefix
+        self.on_host = on_host
+        self.min_cache_page_bytes = min_cache_page_bytes
 
         self._handle = _ProxyDMatrix()
         self._exception: Optional[Exception] = None
         self._enable_categorical = False
-        self._allow_host = True
         self._release = release_data
         # Stage data in Python until reset or next is called to avoid data being free.
         self._temporary_data: Optional[TransformedData] = None
         self._data_ref: Optional[weakref.ReferenceType] = None
 
-    def get_callbacks(
-        self, allow_host: bool, enable_categorical: bool
-    ) -> Tuple[Callable, Callable]:
+    def get_callbacks(self, enable_categorical: bool) -> Tuple[Callable, Callable]:
         """Get callback functions for iterating in C. This is an internal function."""
         assert hasattr(self, "cache_prefix"), "__init__ is not called."
         self._reset_callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(
@@ -535,7 +585,6 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
             ctypes.c_int,
             ctypes.c_void_p,
         )(self._next_wrapper)
-        self._allow_host = allow_host
         self._enable_categorical = enable_categorical
         return self._reset_callback, self._next_callback
 
@@ -624,7 +673,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
                 )
             # Stage the data, meta info are copied inside C++ MetaInfo.
             self._temporary_data = (new, cat_codes, feature_names, feature_types)
-            dispatch_proxy_set_data(self.proxy, new, cat_codes, self._allow_host)
+            dispatch_proxy_set_data(self.proxy, new, cat_codes)
             self.proxy.set_info(
                 feature_names=feature_names,
                 feature_types=feature_types,
@@ -632,8 +681,11 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
             )
             self._data_ref = ref
 
+        # Release the data before next batch is loaded.
+        if self._release:
+            self._temporary_data = None
         # pylint: disable=not-callable
-        return self._handle_exception(lambda: self.next(input_data), 0)
+        return self._handle_exception(lambda: int(self.next(input_data)), 0)
 
     @abstractmethod
     def reset(self) -> None:
@@ -641,7 +693,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
         raise NotImplementedError()
 
     @abstractmethod
-    def next(self, input_data: Callable) -> int:
+    def next(self, input_data: Callable) -> bool:
         """Set the next batch of data.
 
         Parameters
@@ -653,7 +705,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
 
         Returns
         -------
-        0 if there's no more batch, otherwise 1.
+        False if there's no more batch, otherwise True.
 
         """
         raise NotImplementedError()
@@ -875,7 +927,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             return
 
         handle, feature_names, feature_types = dispatch_data_backend(
-            data,
+            data=data,
             missing=self.missing,
             threads=self.nthread,
             feature_names=feature_names,
@@ -902,22 +954,22 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         if feature_types is not None:
             self.feature_types = feature_types
 
-    def _init_from_iter(self, iterator: DataIter, enable_categorical: bool) -> None:
-        it = iterator
-        args = {
-            "missing": self.missing,
-            "nthread": self.nthread,
-            "cache_prefix": it.cache_prefix if it.cache_prefix else "",
-        }
-        args_cstr = from_pystr_to_cstr(json.dumps(args))
+    def _init_from_iter(self, it: DataIter, enable_categorical: bool) -> None:
+        args = make_jcargs(
+            missing=self.missing,
+            nthread=self.nthread,
+            cache_prefix=it.cache_prefix if it.cache_prefix else "",
+            on_host=it.on_host,
+            min_cache_page_bytes=it.min_cache_page_bytes,
+        )
         handle = ctypes.c_void_p()
-        reset_callback, next_callback = it.get_callbacks(True, enable_categorical)
+        reset_callback, next_callback = it.get_callbacks(enable_categorical)
         ret = _LIB.XGDMatrixCreateFromCallback(
             None,
             it.proxy.handle,
             reset_callback,
             next_callback,
-            args_cstr,
+            args,
             ctypes.byref(handle),
         )
         it.reraise()
@@ -1062,7 +1114,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
 
         dispatch_meta_backend(self, data, field, "uint32")
 
-    def save_binary(self, fname: Union[str, os.PathLike], silent: bool = True) -> None:
+    def save_binary(self, fname: PathLike, silent: bool = True) -> None:
         """Save DMatrix to an XGBoost buffer.  Saved binary can be later loaded
         by providing the path to :py:func:`xgboost.DMatrix` as input.
 
@@ -1437,37 +1489,40 @@ class _ProxyDMatrix(DMatrix):
         self.handle = ctypes.c_void_p()
         _check_call(_LIB.XGProxyDMatrixCreate(ctypes.byref(self.handle)))
 
-    def _set_data_from_cuda_interface(self, data: DataType) -> None:
-        """Set data from CUDA array interface."""
+    def _ref_data_from_cuda_interface(self, data: DataType) -> None:
+        """Reference data from CUDA array interface."""
         interface = data.__cuda_array_interface__
         interface_str = bytes(json.dumps(interface), "utf-8")
         _check_call(
             _LIB.XGProxyDMatrixSetDataCudaArrayInterface(self.handle, interface_str)
         )
 
-    def _set_data_from_cuda_columnar(self, data: DataType, cat_codes: list) -> None:
-        """Set data from CUDA columnar format."""
+    def _ref_data_from_cuda_columnar(self, data: DataType, cat_codes: list) -> None:
+        """Reference data from CUDA columnar format."""
         from .data import _cudf_array_interfaces
 
         interfaces_str = _cudf_array_interfaces(data, cat_codes)
         _check_call(_LIB.XGProxyDMatrixSetDataCudaColumnar(self.handle, interfaces_str))
 
-    def _set_data_from_array(self, data: np.ndarray) -> None:
-        """Set data from numpy array."""
+    def _ref_data_from_array(self, data: np.ndarray) -> None:
+        """Reference data from numpy array."""
         from .data import _array_interface
 
         _check_call(
             _LIB.XGProxyDMatrixSetDataDense(self.handle, _array_interface(data))
         )
 
-    def _set_data_from_pandas(self, data: DataType) -> None:
-        """Set data from a pandas DataFrame. The input is a PandasTransformed instance."""
+    def _ref_data_from_pandas(self, data: DataType) -> None:
+        """Reference data from a pandas DataFrame. The input is a PandasTransformed
+        instance.
+
+        """
         _check_call(
             _LIB.XGProxyDMatrixSetDataColumnar(self.handle, data.array_interface())
         )
 
-    def _set_data_from_csr(self, csr: scipy.sparse.csr_matrix) -> None:
-        """Set data from scipy csr"""
+    def _ref_data_from_csr(self, csr: scipy.sparse.csr_matrix) -> None:
+        """Reference data from scipy csr."""
         from .data import _array_interface
 
         _LIB.XGProxyDMatrixSetDataCSR(
@@ -1485,7 +1540,7 @@ class QuantileDMatrix(DMatrix):
     by avoiding intermediate storage. Set ``max_bin`` to control the number of bins
     during quantisation, which should be consistent with the training parameter
     ``max_bin``. When ``QuantileDMatrix`` is used for validation/test dataset, ``ref``
-    should be another ``QuantileDMatrix``(or ``DMatrix``, but not recommended as it
+    should be another ``QuantileDMatrix`` or ``DMatrix``, but not recommended as it
     defeats the purpose of saving memory) constructed from training dataset.  See
     :py:obj:`xgboost.DMatrix` for documents on meta info.
 
@@ -1496,6 +1551,20 @@ class QuantileDMatrix(DMatrix):
         information may be lost in quantisation.
 
     .. versionadded:: 1.7.0
+
+    Examples
+    --------
+
+    .. code-block::
+
+        from sklearn.datasets import make_regression
+        from sklearn.model_selection import train_test_split
+
+        X, y = make_regression()
+        X_train, X_test, y_train, y_test = train_test_split(X, y)
+        Xy_train = xgb.QuantileDMatrix(X_train, y_train)
+        # It's necessary to have the training DMatrix as a reference for valid quantiles.
+        Xy_test = xgb.QuantileDMatrix(X_test, y_test, ref=Xy_train)
 
     Parameters
     ----------
@@ -1508,6 +1577,21 @@ class QuantileDMatrix(DMatrix):
         validation/test dataset with ``QuantileDMatrix``. Supplying the training DMatrix
         as a reference means that the same quantisation applied to the training data is
         applied to the validation/test data
+
+    max_quantile_batches :
+        For GPU-based inputs from an iterator, XGBoost handles incoming batches with
+        multiple growing substreams. This parameter sets the maximum number of batches
+        before XGBoost can cut the sub-stream and create a new one. This can help bound
+        the memory usage. By default, XGBoost grows new sub-streams exponentially until
+        batches are exhausted. Only used for the training dataset and the default is
+        None (unbounded). Lastly, if the `data` is a single batch instead of an
+        iterator, this parameter has no effect.
+
+        .. versionadded:: 3.0.0
+
+        .. warning::
+
+            This is an experimental parameter and subject to change.
 
     """
 
@@ -1532,6 +1616,7 @@ class QuantileDMatrix(DMatrix):
         label_upper_bound: Optional[ArrayLike] = None,
         feature_weights: Optional[ArrayLike] = None,
         enable_categorical: bool = False,
+        max_quantile_batches: Optional[int] = None,
         data_split_mode: DataSplitMode = DataSplitMode.ROW,
     ) -> None:
         self.max_bin = max_bin
@@ -1583,6 +1668,7 @@ class QuantileDMatrix(DMatrix):
             feature_names=feature_names,
             feature_types=feature_types,
             enable_categorical=enable_categorical,
+            max_quantile_blocks=max_quantile_batches,
         )
 
     def _init(
@@ -1590,6 +1676,7 @@ class QuantileDMatrix(DMatrix):
         data: DataType,
         ref: Optional[DMatrix],
         enable_categorical: bool,
+        max_quantile_blocks: Optional[int],
         **meta: Any,
     ) -> None:
         from .data import (
@@ -1609,7 +1696,7 @@ class QuantileDMatrix(DMatrix):
             it = SingleBatchInternalIter(data=data, **meta)
 
         handle = ctypes.c_void_p()
-        reset_callback, next_callback = it.get_callbacks(True, enable_categorical)
+        reset_callback, next_callback = it.get_callbacks(enable_categorical)
         if it.cache_prefix is not None:
             raise ValueError(
                 "QuantileDMatrix doesn't cache data, remove the cache_prefix "
@@ -1617,7 +1704,10 @@ class QuantileDMatrix(DMatrix):
             )
 
         config = make_jcargs(
-            nthread=self.nthread, missing=self.missing, max_bin=self.max_bin
+            nthread=self.nthread,
+            missing=self.missing,
+            max_bin=self.max_bin,
+            max_quantile_blocks=max_quantile_blocks,
         )
         ret = _LIB.XGQuantileDMatrixCreateFromCallback(
             None,
@@ -1634,18 +1724,103 @@ class QuantileDMatrix(DMatrix):
         self.handle = handle
 
 
-class DeviceQuantileDMatrix(QuantileDMatrix):
-    """Use `QuantileDMatrix` instead.
+class ExtMemQuantileDMatrix(DMatrix):
+    """The external memory version of the :py:class:`QuantileDMatrix`.
 
-    .. deprecated:: 1.7.0
+    See :doc:`/tutorials/external_memory` for explanation and usage examples, and
+    :py:class:`QuantileDMatrix` for parameter document.
 
-    .. versionadded:: 1.1.0
+    .. warning::
+
+        This is an experimental feature and subject to change.
+
+    .. versionadded:: 3.0.0
 
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn("Please use `QuantileDMatrix` instead.", FutureWarning)
-        super().__init__(*args, **kwargs)
+    @_deprecate_positional_args
+    def __init__(  # pylint: disable=super-init-not-called
+        self,
+        data: DataIter,
+        *,
+        missing: Optional[float] = None,
+        nthread: Optional[int] = None,
+        max_bin: Optional[int] = None,
+        ref: Optional[DMatrix] = None,
+        enable_categorical: bool = False,
+        max_num_device_pages: Optional[int] = None,
+        max_quantile_batches: Optional[int] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        data :
+            A user-defined :py:class:`DataIter` for loading data.
+
+        max_num_device_pages :
+            For a GPU-based validation dataset, XGBoost can optionally cache some pages
+            in device memory instead of host memory to reduce data transfer. Each cached
+            page has size of `min_cache_page_bytes`. Set this to 0 if you don't want
+            pages to be cached in the device memory. This can be useful for preventing
+            OOM error where there are more than one validation datasets. The default
+            number of device-based page is 1. Lastly, XGBoost infers whether a dataset
+            is used for valdiation by checking whether ref is not None.
+
+        max_quantile_batches :
+            See :py:class:`QuantileDMatrix`.
+
+        """
+        self.max_bin = max_bin
+        self.missing = missing if missing is not None else np.nan
+        self.nthread = nthread if nthread is not None else -1
+
+        self._init(
+            data,
+            ref,
+            enable_categorical=enable_categorical,
+            max_num_device_pages=max_num_device_pages,
+            max_quantile_blocks=max_quantile_batches,
+        )
+        assert self.handle is not None
+
+    def _init(
+        self,
+        it: DataIter,
+        ref: Optional[DMatrix],
+        *,
+        enable_categorical: bool,
+        max_num_device_pages: Optional[int] = None,
+        max_quantile_blocks: Optional[int] = None,
+    ) -> None:
+        args = make_jcargs(
+            missing=self.missing,
+            nthread=self.nthread,
+            cache_prefix=it.cache_prefix if it.cache_prefix else "",
+            on_host=it.on_host,
+            max_bin=self.max_bin,
+            min_cache_page_bytes=it.min_cache_page_bytes,
+            max_num_device_pages=max_num_device_pages,
+            # It's called blocks internally due to block-based quantile sketching.
+            max_quantile_blocks=max_quantile_blocks,
+        )
+        handle = ctypes.c_void_p()
+        reset_callback, next_callback = it.get_callbacks(enable_categorical)
+        # We don't need the iter handle (hence None) in Python as reset,next callbacks
+        # are member functions, and ctypes can handle the `self` parameter
+        # automatically.
+        ret = _LIB.XGExtMemQuantileDMatrixCreateFromCallback(
+            None,  # iter
+            it.proxy.handle,  # proxy
+            ref.handle if ref is not None else ref,  # ref
+            reset_callback,  # reset
+            next_callback,  # next
+            args,  # config
+            ctypes.byref(handle),  # out
+        )
+        it.reraise()
+        # delay check_call to throw intermediate exception first
+        _check_call(ret)
+        self.handle = handle
 
 
 Objective = Callable[[np.ndarray, DMatrix], Tuple[np.ndarray, np.ndarray]]
@@ -1828,7 +2003,7 @@ class Booster:
             state["handle"] = handle
         self.__dict__.update(state)
 
-    def __getitem__(self, val: Union[Integer, tuple, slice]) -> "Booster":
+    def __getitem__(self, val: Union[Integer, tuple, slice, EllipsisType]) -> "Booster":
         """Get a slice of the tree-based model.
 
         .. versionadded:: 1.3.0
@@ -1837,21 +2012,20 @@ class Booster:
         # convert to slice for all other types
         if isinstance(val, (np.integer, int)):
             val = slice(int(val), int(val + 1))
-        if isinstance(val, type(Ellipsis)):
+        if isinstance(val, EllipsisType):
             val = slice(0, 0)
         if isinstance(val, tuple):
             raise ValueError("Only supports slicing through 1 dimension.")
         # All supported types are now slice
-        # FIXME(jiamingy): Use `types.EllipsisType` once Python 3.10 is used.
         if not isinstance(val, slice):
-            msg = _expect((int, slice, np.integer, type(Ellipsis)), type(val))
+            msg = _expect((int, slice, np.integer, EllipsisType), type(val))
             raise TypeError(msg)
 
-        if isinstance(val.start, type(Ellipsis)) or val.start is None:
+        if isinstance(val.start, EllipsisType) or val.start is None:
             start = 0
         else:
             start = val.start
-        if isinstance(val.stop, type(Ellipsis)) or val.stop is None:
+        if isinstance(val.stop, EllipsisType) or val.stop is None:
             stop = 0
         else:
             stop = val.stop
@@ -2258,9 +2432,11 @@ class Booster:
         return self.eval_set([(data, name)], iteration)
 
     # pylint: disable=too-many-function-args
+    @_deprecate_positional_args
     def predict(
         self,
         data: DMatrix,
+        *,
         output_margin: bool = False,
         pred_leaf: bool = False,
         pred_contribs: bool = False,
@@ -2393,9 +2569,11 @@ class Booster:
         return _prediction_output(shape, dims, preds, False)
 
     # pylint: disable=too-many-statements
+    @_deprecate_positional_args
     def inplace_predict(
         self,
         data: DataType,
+        *,
         iteration_range: IterationRange = (0, 0),
         predict_type: str = "value",
         missing: float = np.nan,
@@ -2612,7 +2790,7 @@ class Booster:
             "Data type:" + str(type(data)) + " not supported by inplace prediction."
         )
 
-    def save_model(self, fname: Union[str, os.PathLike]) -> None:
+    def save_model(self, fname: PathLike) -> None:
         """Save the model to a file.
 
         The model is saved in an XGBoost internal format which is universal among the
@@ -2649,7 +2827,7 @@ class Booster:
         Parameters
         ----------
         raw_format :
-            Format of output buffer. Can be `json`, `ubj` or `deprecated`.
+            Format of output buffer. Can be `json` or `ubj`.
 
         Returns
         -------
@@ -2685,9 +2863,12 @@ class Booster:
             Input file name or memory buffer(see also save_raw)
 
         """
-        if isinstance(fname, (str, os.PathLike)):
-            # assume file name, cannot use os.path.exist to check, file can be
-            # from URL.
+
+        def is_pathlike(path: ModelIn) -> TypeGuard[os.PathLike[str]]:
+            return isinstance(path, os.PathLike)
+
+        if isinstance(fname, str) or is_pathlike(fname):
+            # assume file name, cannot use os.path.exist to check, file can be from URL.
             fname = os.fspath(os.path.expanduser(fname))
             _check_call(_LIB.XGBoosterLoadModel(self.handle, c_str(fname)))
         elif isinstance(fname, bytearray):
@@ -2747,8 +2928,8 @@ class Booster:
 
     def dump_model(
         self,
-        fout: Union[str, os.PathLike],
-        fmap: Union[str, os.PathLike] = "",
+        fout: PathLike,
+        fmap: PathLike = "",
         with_stats: bool = False,
         dump_format: str = "text",
     ) -> None:
@@ -2792,7 +2973,7 @@ class Booster:
 
     def get_dump(
         self,
-        fmap: Union[str, os.PathLike] = "",
+        fmap: PathLike = "",
         with_stats: bool = False,
         dump_format: str = "text",
     ) -> List[str]:
@@ -2826,9 +3007,7 @@ class Booster:
         res = from_cstr_to_pystr(sarr, length)
         return res
 
-    def get_fscore(
-        self, fmap: Union[str, os.PathLike] = ""
-    ) -> Dict[str, Union[float, List[float]]]:
+    def get_fscore(self, fmap: PathLike = "") -> Dict[str, Union[float, List[float]]]:
         """Get feature importance of each feature.
 
         .. note:: Zero-importance features will not be included
@@ -2845,7 +3024,7 @@ class Booster:
         return self.get_score(fmap, importance_type="weight")
 
     def get_score(
-        self, fmap: Union[str, os.PathLike] = "", importance_type: str = "weight"
+        self, fmap: PathLike = "", importance_type: str = "weight"
     ) -> Dict[str, Union[float, List[float]]]:
         """Get feature importance of each feature.
         For tree model Importance type can be defined as:
@@ -2910,7 +3089,7 @@ class Booster:
         return results
 
     # pylint: disable=too-many-statements
-    def trees_to_dataframe(self, fmap: Union[str, os.PathLike] = "") -> DataFrame:
+    def trees_to_dataframe(self, fmap: PathLike = "") -> DataFrame:
         """Parse a boosted tree model text dump into a pandas DataFrame structure.
 
         This feature is only defined when the decision tree model is chosen as base
@@ -3044,7 +3223,7 @@ class Booster:
 
         if feature_names is None and self.feature_names is not None:
             raise ValueError(
-                "training data did not have the following fields: "
+                "data did not contain feature names, but the following fields are expected: "
                 + ", ".join(self.feature_names)
             )
 
@@ -3076,7 +3255,7 @@ class Booster:
     def get_split_value_histogram(
         self,
         feature: str,
-        fmap: Union[os.PathLike, str] = "",
+        fmap: PathLike = "",
         bins: Optional[int] = None,
         as_pandas: bool = True,
     ) -> Union[np.ndarray, DataFrame]:

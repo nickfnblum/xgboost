@@ -130,10 +130,9 @@ To build and run C++ unit tests enable tests while running CMake:
 
 .. code-block:: bash
 
-  mkdir build
-  cd build
-  cmake -GNinja -DGOOGLE_TEST=ON -DUSE_DMLC_GTEST=ON -DUSE_CUDA=ON -DUSE_NCCL=ON ..
-  ninja
+  cmake -B build -S . -GNinja -DGOOGLE_TEST=ON -DUSE_DMLC_GTEST=ON -DUSE_CUDA=ON -DUSE_NCCL=ON
+  cmake --build build
+  cd ./build
   ./testxgboost
 
 Flags like ``USE_CUDA``, ``USE_DMLC_GTEST`` are optional. For more info about how to build
@@ -143,6 +142,14 @@ which provides higher flexibility. For example:
 .. code-block:: bash
 
   ctest --verbose
+
+If you need to debug errors on Windows using the debugger from VS, you can append the gtest flags in `test_main.cc`:
+
+.. code-block::
+
+  ::testing::GTEST_FLAG(filter) = "Suite.Test";
+  ::testing::GTEST_FLAG(repeat) = 10;
+
 
 ***********************************************
 Sanitizers: Detect memory errors and data races

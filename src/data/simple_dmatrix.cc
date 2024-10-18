@@ -1,5 +1,5 @@
 /**
- * Copyright 2014~2023, XGBoost Contributors
+ * Copyright 2014-2024, XGBoost Contributors
  * \file simple_dmatrix.cc
  * \brief the input data structure for gradient boosting
  * \author Tianqi Chen
@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../collective/communicator-inl.h"  // for GetWorldSize, GetRank, Allgather
+#include "../collective/allgather.h"
 #include "../common/error_msg.h"             // for InconsistentMaxBin
 #include "./simple_batch_iterator.h"
 #include "adapter.h"
@@ -30,6 +31,9 @@ const MetaInfo& SimpleDMatrix::Info() const { return info_; }
 DMatrix* SimpleDMatrix::Slice(common::Span<int32_t const> ridxs) {
   auto out = new SimpleDMatrix;
   SparsePage& out_page = *out->sparse_page_;
+  // Convert to uint64 to avoid a breaking change in the C API. The performance impact is
+  // small since we have to iteratve through the sparse page.
+  std::vector<bst_idx_t> h_ridx(ridxs.data(), ridxs.data() + ridxs.size());
   for (auto const& page : this->GetBatches<SparsePage>()) {
     auto batch = page.GetView();
     auto& h_data = out_page.data.HostVector();
@@ -41,8 +45,8 @@ DMatrix* SimpleDMatrix::Slice(common::Span<int32_t const> ridxs) {
       std::copy(inst.begin(), inst.end(), std::back_inserter(h_data));
       h_offset.emplace_back(rptr);
     }
-    out->Info() = this->Info().Slice(ridxs);
-    out->Info().num_nonzero_ = h_offset.back();
+    auto ctx = this->fmat_ctx_.MakeCPU();
+    out->Info() = this->Info().Slice(&ctx, h_ridx, h_offset.back());
   }
   out->fmat_ctx_ = this->fmat_ctx_;
   return out;
@@ -59,7 +63,7 @@ DMatrix* SimpleDMatrix::SliceCol(int num_slices, int slice_id) {
     auto& h_data = out_page.data.HostVector();
     auto& h_offset = out_page.offset.HostVector();
     size_t rptr{0};
-    for (bst_row_t i = 0; i < this->Info().num_row_; i++) {
+    for (bst_idx_t i = 0; i < this->Info().num_row_; i++) {
       auto inst = batch[i];
       auto prev_size = h_data.size();
       std::copy_if(inst.begin(), inst.end(), std::back_inserter(h_data),
@@ -76,8 +80,11 @@ DMatrix* SimpleDMatrix::SliceCol(int num_slices, int slice_id) {
 
 void SimpleDMatrix::ReindexFeatures(Context const* ctx) {
   if (info_.IsColumnSplit() && collective::GetWorldSize() > 1) {
-    auto const cols = collective::Allgather(info_.num_col_);
-    auto const offset = std::accumulate(cols.cbegin(), cols.cbegin() + collective::GetRank(), 0ul);
+    std::vector<std::uint64_t> buffer(collective::GetWorldSize());
+    buffer[collective::GetRank()] = info_.num_col_;
+    auto rc = collective::Allgather(ctx, linalg::MakeVec(buffer.data(), buffer.size()));
+    SafeColl(rc);
+    auto offset = std::accumulate(buffer.cbegin(), buffer.cbegin() + collective::GetRank(), 0);
     if (offset == 0) {
       return;
     }
@@ -181,12 +188,12 @@ BatchSet<GHistIndexMatrix> SimpleDMatrix::GetGradientIndex(Context const* ctx,
     CHECK_GE(param.max_bin, 2);
     // Used only by approx.
     auto sorted_sketch = param.regen;
-    if (ctx->IsCPU()) {
+    if (!ctx->IsCUDA()) {
       // The context passed in is on CPU, we pick it first since we prioritize the context
       // in Booster.
       gradient_index_.reset(new GHistIndexMatrix{ctx, this, param.max_bin, param.sparse_thresh,
                                                  sorted_sketch, param.hess});
-    } else if (fmat_ctx_.IsCPU()) {
+    } else if (!fmat_ctx_.IsCUDA()) {
       // DMatrix was initialized on CPU, we use the context from initialization.
       gradient_index_.reset(new GHistIndexMatrix{&fmat_ctx_, this, param.max_bin,
                                                  param.sparse_thresh, sorted_sketch, param.hess});
@@ -290,16 +297,14 @@ SimpleDMatrix::SimpleDMatrix(AdapterT* adapter, float missing, int nthread,
         IteratorAdapter<DataIterHandle, XGBCallbackDataIterNext, XGBoostBatchCSR>;
     // If AdapterT is either IteratorAdapter or FileAdapter type, use the total batch size to
     // determine the correct number of rows, as offset_vec may be too short
-    if (std::is_same<AdapterT, IteratorAdapterT>::value ||
-        std::is_same<AdapterT, FileAdapter>::value) {
+    if (std::is_same_v<AdapterT, IteratorAdapterT> || std::is_same_v<AdapterT, FileAdapter>) {
       info_.num_row_ = total_batch_size;
       // Ensure offset_vec.size() - 1 == [number of rows]
       while (offset_vec.size() - 1 < total_batch_size) {
         offset_vec.emplace_back(offset_vec.back());
       }
     } else {
-      CHECK((std::is_same<AdapterT, CSCAdapter>::value ||
-             std::is_same<AdapterT, CSCArrayAdapter>::value))
+      CHECK((std::is_same_v<AdapterT, CSCAdapter> || std::is_same_v<AdapterT, CSCArrayAdapter>))
           << "Expecting CSCAdapter";
       info_.num_row_ = offset_vec.size() - 1;
     }

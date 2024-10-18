@@ -1,5 +1,5 @@
 /**
- * Copyright 2021-2023 by XGBoost Contributors
+ * Copyright 2021-2024, XGBoost Contributors
  */
 #ifndef XGBOOST_TREE_HIST_HISTOGRAM_H_
 #define XGBOOST_TREE_HIST_HISTOGRAM_H_
@@ -7,26 +7,24 @@
 #include <algorithm>   // for max
 #include <cstddef>     // for size_t
 #include <cstdint>     // for int32_t
-#include <functional>  // for function
 #include <utility>     // for move
 #include <vector>      // for vector
 
-#include "../../collective/communicator-inl.h"  // for Allreduce
-#include "../../collective/communicator.h"      // for Operation
-#include "../../common/hist_util.h"             // for GHistRow, ParallelGHi...
-#include "../../common/row_set.h"               // for RowSetCollection
-#include "../../common/threading_utils.h"       // for ParallelFor2d, Range1d, BlockedSpace2d
-#include "../../data/gradient_index.h"          // for GHistIndexMatrix
-#include "expand_entry.h"                       // for MultiExpandEntry, CPUExpandEntry
-#include "hist_cache.h"                         // for BoundedHistCollection
-#include "param.h"                              // for HistMakerTrainParam
-#include "xgboost/base.h"                       // for bst_node_t, bst_target_t, bst_bin_t
-#include "xgboost/context.h"                    // for Context
-#include "xgboost/data.h"                       // for BatchIterator, BatchSet
-#include "xgboost/linalg.h"                     // for MatrixView, All, Vect...
-#include "xgboost/logging.h"                    // for CHECK_GE
-#include "xgboost/span.h"                       // for Span
-#include "xgboost/tree_model.h"                 // for RegTree
+#include "../../collective/allreduce.h"    // for Allreduce
+#include "../../common/hist_util.h"        // for GHistRow, ParallelGHi...
+#include "../../common/row_set.h"          // for RowSetCollection
+#include "../../common/threading_utils.h"  // for ParallelFor2d, Range1d, BlockedSpace2d
+#include "../../data/gradient_index.h"     // for GHistIndexMatrix
+#include "expand_entry.h"                  // for MultiExpandEntry, CPUExpandEntry
+#include "hist_cache.h"                    // for BoundedHistCollection
+#include "param.h"                         // for HistMakerTrainParam
+#include "xgboost/base.h"                  // for bst_node_t, bst_target_t, bst_bin_t
+#include "xgboost/context.h"               // for Context
+#include "xgboost/data.h"                  // for BatchIterator, BatchSet
+#include "xgboost/linalg.h"                // for MatrixView, All, Vect...
+#include "xgboost/logging.h"               // for CHECK_GE
+#include "xgboost/span.h"                  // for Span
+#include "xgboost/tree_model.h"            // for RegTree
 
 namespace xgboost::tree {
 /**
@@ -63,7 +61,7 @@ class HistogramBuilder {
              bool is_col_split, HistMakerTrainParam const *param) {
     n_threads_ = ctx->Threads();
     param_ = p;
-    hist_.Reset(total_bins, param->max_cached_hist_node);
+    hist_.Reset(total_bins, param->MaxCachedHistNodes(ctx->Device()));
     buffer_.Init(total_bins);
     is_distributed_ = is_distributed;
     is_col_split_ = is_col_split;
@@ -78,13 +76,13 @@ class HistogramBuilder {
     common::ParallelFor2d(space, this->n_threads_, [&](size_t nid_in_set, common::Range1d r) {
       const auto tid = static_cast<unsigned>(omp_get_thread_num());
       bst_node_t const nidx = nodes_to_build[nid_in_set];
-      auto elem = row_set_collection[nidx];
+      auto const& elem = row_set_collection[nidx];
       auto start_of_row_set = std::min(r.begin(), elem.Size());
       auto end_of_row_set = std::min(r.end(), elem.Size());
-      auto rid_set = common::RowSetCollection::Elem(elem.begin + start_of_row_set,
-                                                    elem.begin + end_of_row_set, nidx);
+      auto rid_set = common::Span<bst_idx_t const>{elem.begin() + start_of_row_set,
+                                                   elem.begin() + end_of_row_set};
       auto hist = buffer_.GetInitializedHist(tid, nid_in_set);
-      if (rid_set.Size() != 0) {
+      if (rid_set.size() != 0) {
         common::BuildHist<any_missing>(gpair_h, rid_set, gidx, hist, force_read_by_column);
       }
     });
@@ -171,7 +169,7 @@ class HistogramBuilder {
     }
   }
 
-  void SyncHistogram(Context const *, RegTree const *p_tree,
+  void SyncHistogram(Context const *ctx, RegTree const *p_tree,
                      std::vector<bst_node_t> const &nodes_to_build,
                      std::vector<bst_node_t> const &nodes_to_trick) {
     auto n_total_bins = buffer_.TotalBins();
@@ -186,8 +184,10 @@ class HistogramBuilder {
       CHECK(!nodes_to_build.empty());
       auto first_nidx = nodes_to_build.front();
       std::size_t n = n_total_bins * nodes_to_build.size() * 2;
-      collective::Allreduce<collective::Operation::kSum>(
-          reinterpret_cast<double *>(this->hist_[first_nidx].data()), n);
+      auto rc = collective::Allreduce(
+          ctx, linalg::MakeVec(reinterpret_cast<double *>(this->hist_[first_nidx].data()), n),
+          collective::Op::kSum);
+      SafeColl(rc);
     }
 
     common::BlockedSpace2d const &subspace =

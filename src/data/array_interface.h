@@ -6,28 +6,25 @@
 #ifndef XGBOOST_DATA_ARRAY_INTERFACE_H_
 #define XGBOOST_DATA_ARRAY_INTERFACE_H_
 
-#include <algorithm>
-#include <cstddef>  // for size_t
-#include <cstdint>
-#include <limits>  // for numeric_limits
-#include <map>
-#include <string>
-#include <type_traits>  // for alignment_of, remove_pointer_t, invoke_result_t
-#include <utility>
-#include <vector>
+#include <algorithm>    // for all_of, transform, fill
+#include <cstddef>      // for size_t
+#include <cstdint>      // for int32_t, int64_t, ...
+#include <limits>       // for numeric_limits
+#include <map>          // for map
+#include <string>       // for string
+#include <type_traits>  // for alignment_of_v, remove_pointer_t, invoke_result_t
+#include <vector>       // for vector
 
-#include "../common/bitfield.h"  // for RBitField8
-#include "../common/common.h"
+#include "../common/bitfield.h"   // for RBitField8
 #include "../common/error_msg.h"  // for NoF128
-#include "xgboost/base.h"
-#include "xgboost/data.h"
-#include "xgboost/json.h"
-#include "xgboost/linalg.h"
-#include "xgboost/logging.h"
-#include "xgboost/span.h"
+#include "xgboost/json.h"         // for Json
+#include "xgboost/linalg.h"       // for CalcStride, TensorView
+#include "xgboost/logging.h"      // for CHECK
+#include "xgboost/span.h"         // for Span
+#include "xgboost/string_view.h"  // for StringView
 
 #if defined(XGBOOST_USE_CUDA)
-#include "cuda_fp16.h"
+#include "cuda_fp16.h"  // for __half
 #endif
 
 namespace xgboost {
@@ -337,7 +334,7 @@ struct ToDType<double> {
 };
 template <typename T>
 struct ToDType<T,
-               std::enable_if_t<std::is_same<T, long double>::value && sizeof(long double) == 16>> {
+               std::enable_if_t<std::is_same_v<T, long double> && sizeof(long double) == 16>> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kF16;
 };
 // uint
@@ -410,7 +407,7 @@ class ArrayInterface {
     auto typestr = get<String const>(array.at("typestr"));
     this->AssignType(StringView{typestr});
     ArrayInterfaceHandler::ExtractShape(array, shape);
-    size_t itemsize = typestr[2] - '0';
+    std::size_t itemsize = typestr[2] - '0';
     is_contiguous = ArrayInterfaceHandler::ExtractStride(array, itemsize, shape, strides);
     n = linalg::detail::CalcSize(shape);
 
@@ -419,7 +416,9 @@ class ArrayInterface {
 
     auto alignment = this->ElementAlignment();
     auto ptr = reinterpret_cast<uintptr_t>(this->data);
-    CHECK_EQ(ptr % alignment, 0) << "Input pointer misalignment.";
+    if (!std::all_of(this->shape, this->shape + D, [](auto v) { return v == 0; })) {
+      CHECK_EQ(ptr % alignment, 0) << "Input pointer misalignment.";
+    }
 
     if (allow_mask) {
       common::Span<RBitField8::value_type> s_mask;
@@ -556,7 +555,7 @@ class ArrayInterface {
   }
   [[nodiscard]] XGBOOST_DEVICE std::size_t ElementAlignment() const {
     return this->DispatchCall([](auto *typed_data_ptr) {
-      return std::alignment_of<std::remove_pointer_t<decltype(typed_data_ptr)>>::value;
+      return std::alignment_of_v<std::remove_pointer_t<decltype(typed_data_ptr)>>;
     });
   }
 
@@ -568,9 +567,8 @@ class ArrayInterface {
 #if defined(XGBOOST_USE_CUDA)
       // No operator defined for half -> size_t
       using Type = std::conditional_t<
-          std::is_same<__half,
-                       std::remove_cv_t<std::remove_pointer_t<decltype(p_values)>>>::value &&
-              std::is_same<std::size_t, std::remove_cv_t<T>>::value,
+          std::is_same_v<__half, std::remove_cv_t<std::remove_pointer_t<decltype(p_values)>>> &&
+              std::is_same_v<std::size_t, std::remove_cv_t<T>>,
           unsigned long long, T>;  // NOLINT
       return static_cast<T>(static_cast<Type>(p_values[offset]));
 #else
@@ -615,7 +613,12 @@ auto DispatchDType(ArrayInterfaceHandler::Type dtype, Fn dispatch) {
     case ArrayInterfaceHandler::kF16: {
       using T = long double;
       CHECK(sizeof(T) == 16) << error::NoF128();
-      return dispatch(T{});
+      // Avoid invalid type.
+      if constexpr (sizeof(T) == 16) {
+        return dispatch(T{});
+      } else {
+        return dispatch(double{});
+      }
     }
     case ArrayInterfaceHandler::kI1: {
       return dispatch(std::int8_t{});

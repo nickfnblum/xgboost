@@ -1,6 +1,8 @@
 XGBoost Change Log
 ==================
 
+**Starting from 2.1.0, release note is recorded in the documentation.**
+
 This file records the changes in xgboost library in reverse chronological order.
 
 ## 2.0.0 (2023 Aug 16)
@@ -2101,7 +2103,7 @@ This release marks a major milestone for the XGBoost project.
 ## v0.90 (2019.05.18)
 
 ### XGBoost Python package drops Python 2.x (#4379, #4381)
-Python 2.x is reaching its end-of-life at the end of this year. [Many scientific Python packages are now moving to drop Python 2.x](https://python3statement.org/).
+Python 2.x is reaching its end-of-life at the end of this year. [Many scientific Python packages are now moving to drop Python 2.x](https://python3statement.github.io/).
 
 ### XGBoost4J-Spark now requires Spark 2.4.x (#4377)
 * Spark 2.3 is reaching its end-of-life soon. See discussion at #4389.

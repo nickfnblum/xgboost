@@ -336,6 +336,36 @@ def test_feature_importances_weight():
         cls.feature_importances_
 
 
+def test_feature_importances_weight_vector_leaf() -> None:
+    from sklearn.datasets import make_multilabel_classification
+
+    X, y = make_multilabel_classification(random_state=1994)
+    with pytest.raises(ValueError, match="gain/total_gain"):
+        clf = xgb.XGBClassifier(multi_strategy="multi_output_tree")
+        clf.fit(X, y)
+        clf.feature_importances_
+
+    with pytest.raises(ValueError, match="cover/total_cover"):
+        clf = xgb.XGBClassifier(
+            multi_strategy="multi_output_tree", importance_type="cover"
+        )
+        clf.fit(X, y)
+        clf.feature_importances_
+
+    clf = xgb.XGBClassifier(
+        multi_strategy="multi_output_tree",
+        importance_type="weight",
+        colsample_bynode=0.2,
+    )
+    clf.fit(X, y, feature_weights=np.arange(0, X.shape[1]))
+    fi = clf.feature_importances_
+    assert fi[0] == 0.0
+    assert fi[-1] > fi[1] * 5
+
+    w = np.polynomial.Polynomial.fit(np.arange(0, X.shape[1]), fi, deg=1)
+    assert w.coef[1] > 0.03
+
+
 @pytest.mark.skipif(**tm.no_pandas())
 def test_feature_importances_gain():
     from sklearn.datasets import load_digits
@@ -1098,9 +1128,10 @@ def test_pandas_input():
     np.testing.assert_equal(model.feature_names_in_, np.array(feature_names))
 
     columns = list(train.columns)
-    random.shuffle(columns, lambda: 0.1)
+    rng.shuffle(columns)
     df_incorrect = df[columns]
-    with pytest.raises(ValueError):
+
+    with pytest.raises(ValueError, match="feature_names mismatch"):
         model.predict(df_incorrect)
 
     clf_isotonic = CalibratedClassifierCV(model, cv="prefit", method="isotonic")
@@ -1130,14 +1161,24 @@ def test_feature_weights(tree_method):
 
     parser_path = os.path.join(tm.demo_dir(__file__), "json-model", "json_parser.py")
     poly_increasing = get_feature_weights(
-        X, y, fw, parser_path, tree_method, xgb.XGBRegressor
+        X=X,
+        y=y,
+        fw=fw,
+        parser_path=parser_path,
+        tree_method=tree_method,
+        model=xgb.XGBRegressor,
     )
 
     fw = np.ones(shape=(kCols,))
     for i in range(kCols):
         fw[i] *= float(kCols - i)
     poly_decreasing = get_feature_weights(
-        X, y, fw, parser_path, tree_method, xgb.XGBRegressor
+        X=X,
+        y=y,
+        fw=fw,
+        parser_path=parser_path,
+        tree_method=tree_method,
+        model=xgb.XGBRegressor,
     )
 
     # Approxmated test, this is dependent on the implementation of random
@@ -1300,20 +1341,12 @@ def test_estimator_reg(estimator, check):
         ):
             estimator.fit(X, y)
         return
-    if (
-        os.environ["PYTEST_CURRENT_TEST"].find("check_estimators_overwrite_params")
-        != -1
-    ):
-        # A hack to pass the scikit-learn parameter mutation tests.  XGBoost regressor
-        # returns actual internal default values for parameters in `get_params`, but
-        # those are set as `None` in sklearn interface to avoid duplication.  So we fit
-        # a dummy model and obtain the default parameters here for the mutation tests.
-        from sklearn.datasets import make_regression
-
-        X, y = make_regression(n_samples=2, n_features=1)
-        estimator.set_params(**xgb.XGBRegressor().fit(X, y).get_params())
-
-    check(estimator)
+    elif os.environ["PYTEST_CURRENT_TEST"].find("check_regressor_multioutput") != -1:
+        # sklearn requires float64
+        with pytest.raises(AssertionError, match="Got float32"):
+            check(estimator)
+    else:
+        check(estimator)
 
 
 def test_categorical():
@@ -1475,3 +1508,32 @@ def test_fit_none() -> None:
 
     with pytest.raises(ValueError, match="labels"):
         xgb.XGBRegressor().fit(X, None)
+
+
+def test_tags() -> None:
+    for reg in [xgb.XGBRegressor(), xgb.XGBRFRegressor()]:
+        tags = reg._more_tags()
+        assert "non_deterministic" not in tags
+        assert tags["multioutput"] is True
+        assert tags["multioutput_only"] is False
+
+    for clf in [xgb.XGBClassifier()]:
+        tags = clf._more_tags()
+        assert "multioutput" not in tags
+        assert tags["multilabel"] is True
+
+    tags = xgb.XGBRanker()._more_tags()
+    assert "multioutput" not in tags
+
+
+def test_doc_link() -> None:
+    for est in [
+        xgb.XGBRegressor(),
+        xgb.XGBClassifier(),
+        xgb.XGBRanker(),
+        xgb.XGBRFRegressor(),
+        xgb.XGBRFClassifier(),
+    ]:
+        name = est.__class__.__name__
+        link = est._get_doc_link()
+        assert f"xgboost.{name}" in link

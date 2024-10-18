@@ -8,6 +8,9 @@
 #define XGBOOST_R_H_ // NOLINT(*)
 
 
+#ifndef R_NO_REMAP
+#  define R_NO_REMAP
+#endif
 #include <R.h>
 #include <Rinternals.h>
 #include <R_ext/Altrep.h>
@@ -24,20 +27,20 @@
 XGB_DLL SEXP XGCheckNullPtr_R(SEXP handle);
 
 /*!
- * \brief set the dimensions of an array in-place
- * \param arr
- * \param dims dimensions to set to the array
- * \return NULL value
- */
-XGB_DLL SEXP XGSetArrayDimInplace_R(SEXP arr, SEXP dims);
-
-/*!
  * \brief set the names of the dimensions of an array in-place
  * \param arr
  * \param dim_names names for the dimensions to set
  * \return NULL value
  */
 XGB_DLL SEXP XGSetArrayDimNamesInplace_R(SEXP arr, SEXP dim_names);
+
+/*!
+ * \brief set the names of a vector in-place
+ * \param arr
+ * \param names names for the dimensions to set
+ * \return NULL value
+ */
+XGB_DLL SEXP XGSetVectorNamesInplace_R(SEXP arr, SEXP names);
 
 /*!
  * \brief Set global configuration
@@ -112,9 +115,10 @@ XGB_DLL SEXP XGDMatrixCreateFromCSR_R(SEXP indptr, SEXP indices, SEXP data, SEXP
  * \brief create a new dmatrix from sliced content of existing matrix
  * \param handle instance of data matrix to be sliced
  * \param idxset index set
+ * \param allow_groups Whether to allow slicing the DMatrix if it has a 'group' field
  * \return a sliced new matrix
  */
-XGB_DLL SEXP XGDMatrixSliceDMatrix_R(SEXP handle, SEXP idxset);
+XGB_DLL SEXP XGDMatrixSliceDMatrix_R(SEXP handle, SEXP idxset, SEXP allow_groups);
 
 /*!
  * \brief load a data matrix into binary file
